@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/images/icon.png" width="128" alt="Rhemion icon">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.png">
+    <img src="docs/images/logo-light.png" width="128" alt="Rhemion logo">
+  </picture>
 </p>
 
 <h1 align="center">Rhemion</h1>
