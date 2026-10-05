@@ -1,0 +1,12 @@
+.DS_Store
+native/.build/
+native/.build-app/
+native/.build-lock
+/Rhemion.app/
+/release/
+*.zip
+*.sha256
+*.p12
+*.cer
+*.key
+*.pem

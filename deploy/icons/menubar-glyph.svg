@@ -1,0 +1,8 @@
+<svg width="36" height="36" viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg">
+  <!-- template menu-bar glyph (T3): a large orb (the user's double) and its two loudest rings -->
+  <g fill="none" stroke="#000">
+    <circle cx="18" cy="18" r="9.0" stroke-width="1.8" opacity="0.9"/>
+    <circle cx="18" cy="18" r="13.2" stroke-width="1.4" opacity="0.45"/>
+  </g>
+  <circle cx="18" cy="18" r="5.4" fill="#000"/>
+</svg>
