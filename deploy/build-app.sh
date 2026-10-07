@@ -46,6 +46,19 @@ for f in "$FLUID"/ThirdPartyLicenses/*; do cp "$f" "$LICENSES/FluidAudio-$(basen
 # App icon: one icon (no light/dark choice); the compiled .icns is the bundle's icon for Finder/Dock/Cmd-Tab.
 cp "$ROOT"/deploy/icons/AppIcon.icns     "$APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT"/deploy/icons/MenuBarGlyph.png "$APP/Contents/Resources/MenuBarGlyph.png"  # monochrome tray glyph (template)
+# macOS 26 (Liquid Glass): the layered Icon Composer source deploy/icons/AppIcon.icon compiled into Assets.car,
+# picked up through CFBundleIconName. macOS 15, and a build without full Xcode (no actool), use AppIcon.icns.
+ICON_TMP="$SCRATCH/icon-compile"; rm -rf "$ICON_TMP"; mkdir -p "$ICON_TMP"
+ICON_NAME_KEY=""
+if xcrun actool "$ROOT/deploy/icons/AppIcon.icon" --compile "$ICON_TMP" --platform macosx \
+     --minimum-deployment-target 15.0 --app-icon AppIcon --output-partial-info-plist "$ICON_TMP/partial.plist" \
+     >/dev/null 2>&1 && [ -f "$ICON_TMP/Assets.car" ]; then
+  cp "$ICON_TMP/Assets.car" "$APP/Contents/Resources/Assets.car"
+  ICON_NAME_KEY="<key>CFBundleIconName</key><string>AppIcon</string>"
+  echo "compiled Liquid Glass icon"
+else
+  echo "WARN: actool unavailable; macOS 26 shows the classic AppIcon.icns"
+fi
 
 # Runtime helper: the app's OWN runtime, built above into the isolated scratch path (NOT the default
 # .build/release). Building it here keeps the bundled runtime in step with the app sources.
@@ -66,6 +79,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Rhemion</string>
   <key>CFBundleExecutable</key><string>RhemionApp</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
+  ${ICON_NAME_KEY}
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${SHORT_VERSION}</string>
   <key>RhemionVersion</key><string>${FULL_VERSION}</string>

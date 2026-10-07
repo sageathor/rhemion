@@ -46,8 +46,11 @@ public struct ModelOption: Equatable, Sendable {
     /// Loaded and compiled, ready for an instant first dictation. A freshly downloaded (or cache-cleared)
     /// model is found but not warm while the runtime prepares it, which can take tens of seconds.
     public let warm: Bool
-    public init(id: String, label: String, engine: String, found: Bool, warm: Bool = true) {
-        self.id = id; self.label = label; self.engine = engine; self.found = found; self.warm = warm
+    /// On disk but could not be loaded even after a retry (a broken or partial download). The app offers to
+    /// download it again; the runtime then replaces the files instead of keeping them.
+    public let damaged: Bool
+    public init(id: String, label: String, engine: String, found: Bool, warm: Bool = true, damaged: Bool = false) {
+        self.id = id; self.label = label; self.engine = engine; self.found = found; self.warm = warm; self.damaged = damaged
     }
 }
 

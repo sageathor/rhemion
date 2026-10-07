@@ -38,7 +38,8 @@ public enum StorageOperations {
     /// - Exported transcripts = only the notes the registry (or an exact-match re-adoption) proves are Rhemion's.
     /// - Unused models / Model in use = `StorageLayout.modelItems()` (in use = the runtime's EFFECTIVE model).
     /// - Logs = Rhemion's diagnostic logs (app.log, runtime.log, rotated copies) — never the dictation logs.
-    /// - Cache = temporary files + caches + stray marker temps (never logs).
+    /// - Cache = temporary files + the app's cache + stray marker temps (never logs, never the compiled model,
+    ///   which goes with Model in use).
     /// - Reset all settings = settings.json (+ lock), the defaults plist, the saved window state.
     public static func clearItems(_ c: ClearItem, _ l: StorageLayout) -> [StorageItem] {
         switch c {
@@ -47,7 +48,7 @@ public enum StorageOperations {
         case .dictionary: return l.items(.dictionary)
         case .exportedTranscripts: return l.items(.export)
         case .unusedModels: return l.modelItems().unused
-        case .modelInUse: return l.modelItems().inUse
+        case .modelInUse: return l.modelItems().inUse + l.compiledModelItems()
         case .logs: return l.logItems()
         case .cache: return l.cacheItems()
         case .settings: return l.settingsItems()
@@ -233,16 +234,20 @@ public enum StorageOperations {
         return out
     }
 
-    /// `willRemove` is called before each item is attempted (Clear Data's per-row progress).
+    /// `willRemove` is called before each item is attempted, `didRemove` after it with whether it went
+    /// (Clear Data's per-row progress and per-row outcome).
     public static func execute(_ items: [StorageItem], layout l: StorageLayout, effects: SystemEffects,
-                               willRemove: (StorageItem) -> Void = { _ in }) -> OperationReport {
+                               willRemove: (StorageItem) -> Void = { _ in },
+                               didRemove: (StorageItem, Bool) -> Void = { _, _ in }) -> OperationReport {
         var report = OperationReport()
         report.dryRun = effects is DryRunEffects
         for item in items {
             willRemove(item)
-            guard l.isSafe(item) else { report.failures.append("\(item.url.path): refused (outside allowed area)"); continue }
-            do { try effects.remove(item); report.removed.append(item.url.path); report.removedItems.append(item) }
-            catch { report.failures.append("\(error)") }
+            guard l.isSafe(item) else {
+                report.failures.append("\(item.url.path): refused (outside allowed area)"); didRemove(item, false); continue
+            }
+            do { try effects.remove(item); report.removed.append(item.url.path); report.removedItems.append(item); didRemove(item, true) }
+            catch { report.failures.append("\(error)"); didRemove(item, false) }
         }
         report.unconfirmedExport = l.unconfirmedExportFiles()
         if !(effects is DryRunEffects) {   // tidy up folders that are now empty (never the roots' parents)

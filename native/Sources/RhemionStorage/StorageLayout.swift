@@ -334,9 +334,21 @@ public struct StorageLayout: Sendable {
         let strays = ((try? fm.contentsOfDirectory(atPath: stateDir.path)) ?? []).sorted().filter {
             ($0.hasPrefix(".history-retention-") || $0.hasPrefix(".export-last-run-")) && $0.hasSuffix(".tmp")
         }
+        // Not the runtime helper's cache: it is CoreML's compiled speech model (see compiledModelItems), and
+        // clearing it makes the next start prepare the model again (~30 s). It goes with the model instead.
         return items(.temporary)
-            + [item(.applicationData, caches, [bundleID]), item(.applicationData, caches, ["rhemion-runtime"])].compactMap { $0 }
+            + [item(.applicationData, caches, [bundleID])].compactMap { $0 }
             + strays.compactMap { item(.applicationData, stateDir, [$0]) }
+    }
+
+    /// CoreML's compiled form of the speech model, cached for the runtime helper (named after the executable).
+    /// Removed together with the model in use (a compiled copy of a deleted model is dead weight) and on
+    /// uninstall (it is part of `.applicationData`); never by Cache.
+    public func compiledModelItems() -> [StorageItem] {
+        let i = StorageItem(category: .applicationData,
+                            root: home.appendingPathComponent("Library").appendingPathComponent("Caches"),
+                            relative: ["rhemion-runtime"])
+        return FileManager.default.fileExists(atPath: i.url.path) && isSafe(i) ? [i] : []
     }
 
     /// Logs: Rhemion's own diagnostic logs — app.log, runtime.log and their rotated copies (`LogRotation`).

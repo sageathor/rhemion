@@ -10,7 +10,7 @@ import Foundation
 final class DictAdd: @unchecked Sendable {
     /// Fired on the main queue with the current selection ("" if none) when the chord is pressed. The
     /// selection is read here, before the panel steals focus — that ordering is the whole point.
-    var onTrigger: (@Sendable (String) -> Void)?
+    var onTrigger: (@Sendable (String, AXSelection.Target?) -> Void)?
 
     private let hotkeys = CarbonHotkeyGroup(baseID: 20)   // dict-add: ids 20..27
 
@@ -28,6 +28,6 @@ final class DictAdd: @unchecked Sendable {
 
     private func fired() {   // main run loop
         log("dict-add: pressed")
-        onTrigger?(AXSelection.currentSelection() ?? "")
+        onTrigger?(AXSelection.currentSelection() ?? "", AXSelection.currentTarget())
     }
 }

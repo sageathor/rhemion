@@ -19,6 +19,14 @@ enum ClipboardPaste {
         Engine.shared.paste(text, targetPid: targetPid, completion: completion)
     }
 
+    /// A clipboard marked by its owner as concealed (passwords) or transient (one-time codes), per the
+    /// nspasteboard.org convention.
+    static func isSensitive(_ snapshot: [[String: Data]]) -> Bool {
+        snapshot.contains { item in
+            item.keys.contains("org.nspasteboard.ConcealedType") || item.keys.contains("org.nspasteboard.TransientType")
+        }
+    }
+
     private final class Callback: @unchecked Sendable {
         let body: (PasteStatus) -> Void
         init(_ body: @escaping (PasteStatus) -> Void) { self.body = body }
@@ -73,7 +81,11 @@ enum ClipboardPaste {
             } else {
                 pending?.workItem?.cancel()
                 pending = nil
+                let t0 = DispatchTime.now().uptimeNanoseconds
                 savedOriginal = snapshot()
+                let snapMS = (DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
+                // The snapshot sits on the paste path; a big clipboard (images) shows up here.
+                if snapMS >= 20 { log("paste: clipboard snapshot took \(snapMS) ms (\(savedOriginal.count) item(s))") }
             }
 
             let (changeCount, token) = writeTagged(text)
@@ -115,6 +127,13 @@ enum ClipboardPaste {
                 cmdDown.flags = .maskCommand
                 vDown.flags = .maskCommand
                 vUp.flags = .maskCommand
+
+                // Last check before ⌘V: if the user copied something in the last 100 ms, the clipboard is
+                // theirs now. Pasting would insert THEIR content, so do not post, and leave it alone.
+                guard self.stillOwns(changeCount: changeCount, token: token) else {
+                    self.complete(state, .pasteNotPosted)
+                    return
+                }
 
                 state.posted = true
                 cmdDown.post(tap: .cghidEventTap)
@@ -177,6 +196,9 @@ enum ClipboardPaste {
         private func restore(_ snapshot: [[String: Data]]) {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
+            // A password manager's concealed/transient copy is not put back: it clears its own copy on a
+            // timer by watching changeCount, which our paste already moved, so a restored secret would stay.
+            guard !ClipboardPaste.isSensitive(snapshot) else { return }
             let items = snapshot.map { entries in
                 let item = NSPasteboardItem()
                 for (rawType, data) in entries {

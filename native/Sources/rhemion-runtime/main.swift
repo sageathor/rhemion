@@ -129,6 +129,7 @@ final class WarmFlag: @unchecked Sendable {
     func set() { lock.lock(); value = true; lock.unlock() }
 }
 let startupWarm = WarmFlag()
+let startupDamaged = WarmFlag()   // set when the startup model could not be prepared even after a retry
 if let warmEngine = engineRegistry.engine(id: startupModelID) {
     Task.detached(priority: .utility) {
         let start = Date()
@@ -138,12 +139,13 @@ if let warmEngine = engineRegistry.engine(id: startupModelID) {
             try? await Task.sleep(nanoseconds: 5_000_000_000)
             warmed = await warmEngine.prewarm()
         }
-        // Report ready either way: a model that cannot be prepared surfaces its error on the first real
-        // dictation (as before) instead of leaving the app on "Preparing" forever.
+        // Never leave the app on "Preparing" forever. A model that cannot be prepared twice is reported as
+        // damaged: the app says so and offers a fresh download, instead of showing Ready and failing later.
+        if !warmed { startupDamaged.set() }
         startupWarm.set()
         logToStderr(warmed
             ? "[timing] prewarm(\(startupModelID)) done in \(String(format: "%.1f", Date().timeIntervalSince(start)))s"
-            : "[model] prewarm(\(startupModelID)) failed twice; the first dictation will load it")
+            : "[model] prewarm(\(startupModelID)) failed twice; reported as damaged")
     }
 } else {
     startupWarm.set()   // nothing to warm
@@ -207,13 +209,15 @@ let service = RuntimeService(
         // Only the startup model is prewarmed; any other model counts as warm (it loads on first use).
         let models = ModelRegistry.discover(extraDirs: snapshot.modelDirs).map {
             ModelOption(id: $0.id, label: $0.label, engine: $0.engine, found: $0.found,
-                        warm: $0.id != startupModelID || startupWarm.isSet)
+                        warm: $0.id != startupModelID || startupWarm.isSet,
+                        damaged: $0.id == startupModelID && startupDamaged.isSet)
         }
         let mics = CoreAudioDeviceEnumerator.inputDevices().map {
             MicOption(uid: $0.uid, name: $0.name, builtIn: $0.isBuiltIn)
         }
         return (models: models, mics: mics)
-    }
+    },
+    modelDownloader: RuntimeService.fluidDownloader(replace: { startupDamaged.isSet })
 )
 
 // Dictation explicitly uses failTake (also the coordinator default). The retarget policy is
@@ -311,6 +315,20 @@ try server.start { line, connection in
     // detached Tasks — revisit at the delivery milestone.
     Task { await service.handle(line: line, reply: sink) }
 }
+
+// Leave with the app. If Rhemion dies without stopping us (SIGTERM skips applicationWillTerminate, a
+// crash, kill -9), a runtime left behind would share the state folder and socket with the next app's
+// runtime. Watch the parent and exit as soon as it is gone. Exit WITHOUT server.stop(): by then the next
+// runtime may already own runtime.sock, and stop() would unlink it; the next start replaces a stale one.
+let parentPid = getppid()
+let parentWatch: DispatchSourceProcess? = parentPid > 1
+    ? DispatchSource.makeProcessSource(identifier: parentPid, eventMask: .exit, queue: .global()) : nil
+parentWatch?.setEventHandler {
+    FileHandle.standardError.write(Data("rhemion-runtime: parent \(parentPid) exited; exiting\n".utf8))
+    exit(0)
+}
+parentWatch?.resume()
+if parentPid > 1, kill(parentPid, 0) != 0 { exit(0) }   // the parent died before the watch was armed
 
 FileHandle.standardError.write(Data("rhemion-runtime listening on \(socketPath)\n".utf8))
 dispatchMain()

@@ -37,23 +37,29 @@ final class NotchIndicator {
     private var window: NSWindow?
     private var view: IndicatorView?
 
-    init() { style = NotchIndicator.detectDefaultStyle() }
+    init() {
+        style = NotchIndicator.detectDefaultStyle()
+        // Displays change under us (a monitor plugged in, a resolution change, a screen recorder):
+        // the window was placed for the old layout, so re-place it rather than let AppKit shove it.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.screensChanged() } }
+    }
 
     func setStyle(_ newStyle: Style) {
         guard newStyle != style else { return }
         style = newStyle
-        view?.stopAll()
-        window?.orderOut(nil); window = nil; view = nil
+        dropWindow()
     }
 
-    func recording() { ensureWindow(); window?.orderFrontRegardless(); view?.recording() }
+    func recording() { show(); view?.recording() }
     func onLevel(_ rms: Double) { view?.onLevel(rms) }
     func processing() { view?.hold() }   // release freezes the orb; the spinner blooms after a grace
     func done() { view?.done() }
-    func error() { ensureWindow(); window?.orderFrontRegardless(); view?.error() }
+    func error() { show(); view?.error() }
     func hide() { view?.hide() }
     /// Hands-free silence countdown: `remaining` shrinks 1→0; the ring depletes. Speech → cancelCountdown().
-    func countdown(_ remaining: Double) { ensureWindow(); window?.orderFrontRegardless(); view?.countdown(CGFloat(remaining)) }
+    func countdown(_ remaining: Double) { show(); view?.countdown(CGFloat(remaining)) }
     func cancelCountdown() { view?.cancelCountdown() }
 
     /// Speech-model download in progress: a calm amber orb with a ring that FILLS as `fraction` grows 0→1
@@ -61,40 +67,92 @@ final class NotchIndicator {
     /// pressed so the user links the click to the orb; also on a gated PTT press while downloading. The window
     /// stays click-through (never eats notch/menu-bar clicks); the words live on the menu-bar item's tooltip.
     func downloadProgress(_ fraction: Double) {
-        ensureWindow(); window?.orderFrontRegardless(); view?.downloadProgress(CGFloat(max(0, min(1, fraction))))
+        show(); view?.downloadProgress(CGFloat(max(0, min(1, fraction))))
     }
     /// Model not ready and not downloading (absent, or a download that was interrupted/canceled): a brief
     /// amber down-arrow cue on a calm orb, then it retracts. Used on a gated PTT press with no model.
     func downloadHint() {
-        ensureWindow(); window?.orderFrontRegardless(); view?.downloadHint()
+        show(); view?.downloadHint()
     }
     /// Speech model on disk but still being prepared (first load/compile): the spinner dots, held until the
     /// model is ready (endModelCue) instead of a download ring frozen at 100%.
-    func preparing() { ensureWindow(); window?.orderFrontRegardless(); view?.preparing() }
+    func preparing() { show(); view?.preparing() }
     /// End a download/not-ready cue if that's what's showing (e.g. the model just became ready), WITHOUT
     /// disturbing an active recording/processing indicator.
     func endModelCue() { view?.endModelCue() }
 
+    /// Where the indicator belongs right now. The notch plate always goes to the display that HAS a
+    /// notch (the built-in one), not to `NSScreen.main`, which follows the key window to other displays.
+    private struct Layout: Equatable {
+        let frame: NSRect, style: Style, plateH: CGFloat, retractedW: CGFloat, expandedW: CGFloat
+    }
+
+    private func currentLayout() -> Layout? {
+        if style == .notch, let (screen, geo) = NotchIndicator.notchedScreen() {
+            let expanded = geo.width + GK.ext
+            let frame = NSRect(x: screen.frame.minX + geo.left, y: screen.frame.maxY - geo.height,
+                               width: expanded, height: geo.height)
+            return Layout(frame: frame, style: .notch, plateH: geo.height, retractedW: geo.width, expandedW: expanded)
+        }
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return nil }
+        let w: CGFloat = 96, h: CGFloat = 28
+        let frame = NSRect(x: screen.frame.midX - w / 2, y: screen.visibleFrame.maxY - h, width: w, height: h)
+        return Layout(frame: frame, style: .floating, plateH: h, retractedW: w, expandedW: w)
+    }
+
+    private var layout: Layout?
+
+    /// Build the window if needed, put it where the current layout says, and bring it forward.
+    private func show() {
+        ensureWindow()
+        place()
+        window?.orderFrontRegardless()
+    }
+
+    /// Keep the window at its layout position. A drift means something moved it (AppKit on a display
+    /// change): log it once with both frames, then put it back.
+    private func place() {
+        guard let window, let target = currentLayout() else { return }
+        if target != layout {
+            log("indicator: layout changed \(describe(layout)) -> \(describe(target))")
+            if !window.isVisible {
+                dropWindow(); ensureWindow(); return   // idle: rebuild with the new geometry
+            }
+            // Mid-animation: never rebuild (that would drop the state); move it if the size still fits.
+            guard target.frame.size == window.frame.size else { return }
+            layout = target
+        }
+        if window.frame != target.frame {
+            log("indicator: window drifted to \(window.frame) (expected \(target.frame)); restoring")
+            window.setFrame(target.frame, display: false)
+        }
+    }
+
+    private func screensChanged() {
+        let screens = NSScreen.screens.map { "\($0.frame)\($0.safeAreaInsets.top > 0 ? " notch" : "")" }
+        log("indicator: screens changed: \(screens.joined(separator: ", "))")
+        guard let window else { return }
+        if window.isVisible { place() } else { dropWindow() }   // idle: rebuild lazily on next show
+    }
+
+    private func dropWindow() {
+        view?.stopAll()
+        window?.orderOut(nil); window = nil; view = nil; layout = nil
+    }
+
+    private func describe(_ l: Layout?) -> String {
+        guard let l else { return "none" }
+        return "\(l.style == .notch ? "notch" : "floating") \(l.frame)"
+    }
+
     private func ensureWindow() {
         guard window == nil else { return }
-        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        guard let l = currentLayout() else { return }
+        let frame = l.frame
+        let v = IndicatorView(frame: NSRect(origin: .zero, size: frame.size),
+                              style: l.style, plateH: l.plateH, retractedW: l.retractedW, expandedW: l.expandedW)
 
-        let frame: NSRect
-        let v: IndicatorView
-        if style == .notch, let geo = NotchIndicator.notchGeometry(screen) {
-            let expanded = geo.width + GK.ext
-            frame = NSRect(x: screen.frame.minX + geo.left, y: screen.frame.maxY - geo.height,
-                           width: expanded, height: geo.height)
-            v = IndicatorView(frame: NSRect(origin: .zero, size: frame.size),
-                              style: .notch, plateH: geo.height, retractedW: geo.width, expandedW: expanded)
-        } else {
-            let w: CGFloat = 96, h: CGFloat = 28
-            frame = NSRect(x: screen.frame.midX - w / 2, y: screen.visibleFrame.maxY - h, width: w, height: h)
-            v = IndicatorView(frame: NSRect(origin: .zero, size: frame.size),
-                              style: .floating, plateH: h, retractedW: w, expandedW: w)
-        }
-
-        let panel = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        let panel = IndicatorWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.level = .statusBar
@@ -105,6 +163,7 @@ final class NotchIndicator {
         panel.contentView = v
         window = panel
         view = v
+        layout = l
     }
 
     // MARK: - notch geometry
@@ -120,10 +179,18 @@ final class NotchIndicator {
         return NotchGeo(left: left.maxX - screen.frame.minX, width: width, height: left.height)
     }
 
-    private static func detectDefaultStyle() -> Style {
-        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return .floating }
-        return notchGeometry(screen) != nil ? .notch : .floating
+    private static func notchedScreen() -> (NSScreen, NotchGeo)? {
+        for screen in NSScreen.screens { if let geo = notchGeometry(screen) { return (screen, geo) } }
+        return nil
     }
+
+    private static func detectDefaultStyle() -> Style { notchedScreen() != nil ? .notch : .floating }
+}
+
+/// The indicator's borderless window. It sits in the menu-bar band, which AppKit treats as off-limits
+/// for ordinary windows and pushes them out of on a display change; the frame we set is the frame we mean.
+private final class IndicatorWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
 // MARK: - Renderer (immediate-mode)

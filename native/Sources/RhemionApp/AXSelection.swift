@@ -10,6 +10,7 @@
 //
 // Secure fields are never read. Never throws; returns a trimmed non-empty string or nil.
 
+import AppKit
 import ApplicationServices
 import Foundation
 
@@ -31,6 +32,55 @@ enum AXSelection {
             if let text = nonBlank(stringForSelectedTextMarkerRange(web)) { return text }
         }
         return nil
+    }
+
+    /// Where a dict-add selection lives, so the fix can be written back over it after the panel closes.
+    /// Captured only for fields that expose the selection on the focused element itself (rungs 1 and 2);
+    /// web-area selections are read-only here and fall back to the clipboard.
+    struct Target: @unchecked Sendable {   // AXUIElement is an immutable CF handle
+        let pid: pid_t
+        let element: AXUIElement
+        let selected: String   // the raw selection, whitespace included
+    }
+
+    static func currentTarget() -> Target? {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              let element = focusedElement(), !isSecure(element) else { return nil }
+        var selected = stringAttribute(element, kAXSelectedTextAttribute)
+        if nonBlank(selected) == nil, let range = selectedRange(element), range.length > 0 {
+            selected = stringForRange(element, range)
+        }
+        guard let selected, nonBlank(selected) != nil else { return nil }
+        return Target(pid: app.processIdentifier, element: element, selected: selected)
+    }
+
+    enum FixResult: Sendable {
+        case fixed                // the selection now reads the corrected text
+        case notFound             // the selection does not contain the spoken form (the user edited it)
+        case unavailable(String)  // could not write it; the argument is the corrected selection to paste
+    }
+
+    /// Replace `spoken` with `correct` inside the still-selected text of `target`. Writes only when the
+    /// field still holds the exact selection captured at the hotkey press, so it never edits the wrong
+    /// place. Case-insensitive like the dictionary itself.
+    static func fix(_ target: Target, spoken: String, correct: String) -> FixResult {
+        let fixed = target.selected.replacingOccurrences(of: spoken, with: correct, options: .caseInsensitive)
+        guard fixed != target.selected else { return .notFound }
+        guard stringAttribute(target.element, kAXSelectedTextAttribute) == target.selected else {
+            return .unavailable(fixed)   // selection moved or unreadable: do not guess
+        }
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(target.element, kAXSelectedTextAttribute as CFString, &settable) == .success,
+              settable.boolValue else { return .unavailable(fixed) }
+        let before = stringAttribute(target.element, kAXValueAttribute)
+        guard AXUIElementSetAttributeValue(
+            target.element, kAXSelectedTextAttribute as CFString, fixed as CFTypeRef) == .success
+        else { return .unavailable(fixed) }
+        usleep(15_000)
+        // A value that did not change proves the write was ignored (some web and Electron fields).
+        if let before, let after = stringAttribute(target.element, kAXValueAttribute),
+           after.utf8.elementsEqual(before.utf8) { return .unavailable(fixed) }
+        return .fixed
     }
 
     // MARK: - AX helpers

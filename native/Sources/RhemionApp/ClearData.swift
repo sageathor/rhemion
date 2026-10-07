@@ -15,8 +15,9 @@ import RhemionStorage
 import SwiftUI
 
 typealias ClearItem = StorageOperations.ClearItem
-/// `AppController.runClearData(_:progress:)`: deletes the selection; `progress` names the row being deleted.
-typealias ClearDataRun = (Set<ClearItem>, @escaping @MainActor @Sendable (ClearItem) -> Void) async -> OperationReport
+/// `AppController.runClearData(_:progress:)`: deletes the selection; `progress` names the row being deleted
+/// and the rows already known to have failed, so a failed row is never ticked on the way.
+typealias ClearDataRun = (Set<ClearItem>, @escaping @MainActor @Sendable (ClearItem, Set<ClearItem>) -> Void) async -> OperationReport
 
 /// Drives one showing of the Clear Data window and its pop-up: choose → confirm → working → done.
 @MainActor
@@ -427,9 +428,9 @@ final class ClearDataModel: ObservableObject, Identifiable {
         let pacer = ProgressPacer(count: rows.count, clock: pacingClock) { [weak self] in self?.shown = $0 }
         pacer.start()
         Task {
-            let report = await run(chosen) { [weak self] row in
+            let report = await run(chosen) { [weak self] row, failedRows in
                 guard let self, self.phase == .working, let index = rows.firstIndex(of: row) else { return }
-                pacer.advance(to: index)
+                pacer.advance(to: index, failed: Set(rows.indices.filter { failedRows.contains(rows[$0]) }))
             }
             if report.failures == [AppController.busyMessage] {
                 pacer.stop()

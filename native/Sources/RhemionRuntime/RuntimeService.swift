@@ -29,6 +29,12 @@ public extension TakeSink {
 public actor RuntimeService {
     public typealias ModelDownloader = @Sendable (AsrModelVersion, @escaping ProgressHandler) async throws -> URL
 
+    /// FluidAudio's download. `replace()` true re-downloads files already on disk (a damaged model) instead
+    /// of keeping them.
+    public static func fluidDownloader(replace: @escaping @Sendable () -> Bool) -> ModelDownloader {
+        { version, progress in try await AsrModels.download(force: replace(), version: version, progressHandler: progress) }
+    }
+
     private let modelDownloader: ModelDownloader
     private var modelDownloadTask: Task<Void, Never>?
     private let coordinator: SessionCoordinator

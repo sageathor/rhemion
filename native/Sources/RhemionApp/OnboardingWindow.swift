@@ -94,7 +94,8 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
 
     /// Called once on launch: show the Welcome on first run, and again whenever a permission Rhemion needs
     /// is missing (nothing else asks for them; the hotkey and the runtime only wait).
-    func showIfNeeded() { if !Self.hasBeenShown || !PermissionsModel.allGranted { show() } }
+    var needsShowing: Bool { !Self.hasBeenShown || !PermissionsModel.allGranted }
+    func showIfNeeded() { if needsShowing { show() } }
 
     func windowDidBecomeKey(_ notification: Notification) { permissions.refresh() }
     func windowWillClose(_ notification: Notification) {

@@ -1,0 +1,31 @@
+{
+  "fill-specializations" : [
+    { "value" : { "automatic-gradient" : "extended-srgb:0.96078,0.96078,0.96863,1.00000" } },
+    { "appearance" : "dark", "value" : { "automatic-gradient" : "extended-srgb:0.15686,0.15686,0.17255,1.00000" } }
+  ],
+  "groups" : [
+    {
+      "layers" : [
+        { "image-name" : "orb-light.svg", "name" : "orb light",
+          "hidden-specializations" : [ { "value" : false }, { "appearance" : "dark", "value" : true } ] },
+        { "image-name" : "orb.svg", "name" : "orb dark",
+          "hidden-specializations" : [ { "value" : true }, { "appearance" : "dark", "value" : false } ] }
+      ],
+      "shadow" : { "kind" : "neutral", "opacity" : 0.5 },
+      "translucency" : { "enabled" : true, "value" : 0.4 }
+    },
+    {
+      "layers" : [
+        { "image-name" : "rings-light.svg", "name" : "rings light",
+          "hidden-specializations" : [ { "value" : false }, { "appearance" : "dark", "value" : true } ] },
+        { "image-name" : "rings.svg", "name" : "rings dark",
+          "hidden-specializations" : [ { "value" : true }, { "appearance" : "dark", "value" : false } ] }
+      ],
+      "shadow" : { "kind" : "neutral", "opacity" : 0.4 },
+      "translucency" : { "enabled" : true, "value" : 0.5 }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : [ "macOS" ]
+  }
+}

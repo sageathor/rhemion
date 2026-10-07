@@ -303,14 +303,16 @@ final class ProgressPacer {
         loop = Task { [weak self] in await self?.drive() }
     }
 
-    func advance(to step: Int) {
+    /// `failed`: steps the work already knows did not go (all before `step`); they are walked to "not done".
+    func advance(to step: Int, failed newlyFailed: Set<Int> = []) {
         guard !finished, step > reached else { return }
+        failed.formUnion(newlyFailed)
         reached = min(step, count)
         resume()
     }
 
     func finish(notDone: Set<Int> = []) async {
-        failed = notDone
+        failed.formUnion(notDone)
         finished = true
         reached = count
         resume()

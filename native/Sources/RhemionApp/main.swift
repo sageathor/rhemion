@@ -315,7 +315,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// resumes instead. `progress` names the pop-up row being deleted now: the plan runs row by row
     /// (`StorageOperations.clearSteps`), and a settings reset reports its row before it starts.
     func runClearData(_ selection: Set<ClearItem>,
-                      progress: @escaping @MainActor @Sendable (ClearItem) -> Void = { _ in }) async -> OperationReport {
+                      progress: @escaping @MainActor @Sendable (ClearItem, Set<ClearItem>) -> Void = { _, _ in }) async -> OperationReport {
         guard !dataOps.inProgress else { return Self.busyReport() }
         guard await dataOps.quiesce() == .ready else { return Self.stuckReport() }
         destructiveOpRunning = true
@@ -330,26 +330,32 @@ final class AppController: NSObject, NSApplicationDelegate {
         let steps = StorageOperations.clearSteps(layout, selection)
         let plan = steps.map(\.item)
         let rowOf = Dictionary(steps.map { ($0.item, $0.category) }, uniquingKeysWith: { first, _ in first })
-        // Each row as it starts, once (hopped to the main queue in order).
-        let announce: @Sendable (ClearItem) -> Void = { c in DispatchQueue.main.async { MainActor.assumeIsolated { progress(c) } } }
+        // Each row as it starts, once, with the rows that have failed so far (hopped to the main queue in order).
+        let announce: @Sendable (ClearItem, Set<ClearItem>) -> Void = { c, failed in
+            DispatchQueue.main.async { MainActor.assumeIsolated { progress(c, failed) } }
+        }
         // Recordings without the Journal: mark the transcripts first, re-render their notes after (no dead
         // audio references, nothing for the runtime's reconcile to drop) — as audio retention does.
         let recordingsOnly = selection.contains(.recordings) && !selection.contains(.journal) && !dryRun
         var report = await Task.detached(priority: .userInitiated) {
             var current: ClearItem?
+            var failedRows: Set<ClearItem> = []
             var sizes: [StorageItem: Int64] = [:]
             let willRemove: (StorageItem) -> Void = { item in
                 sizes[item] = StorageSizes.size(of: item)   // what this item frees, just before it goes
                 guard let c = rowOf[item], c != current else { return }
-                current = c; announce(c)
+                current = c; announce(c, failedRows)
+            }
+            let didRemove: (StorageItem, Bool) -> Void = { item, ok in
+                if !ok, let c = rowOf[item] { failedRows.insert(c) }
             }
             var r: OperationReport
             if recordingsOnly {
                 let prep = StorageOperations.prepareRecordingsRemoval(plan, layout)
-                r = StorageOperations.execute(prep.plan, layout: layout, effects: effects, willRemove: willRemove)
+                r = StorageOperations.execute(prep.plan, layout: layout, effects: effects, willRemove: willRemove, didRemove: didRemove)
                 r.failures = prep.failures + r.failures + StorageOperations.rerenderHistory(months: prep.months, layout)
             } else {
-                r = StorageOperations.execute(plan, layout: layout, effects: effects, willRemove: willRemove)
+                r = StorageOperations.execute(plan, layout: layout, effects: effects, willRemove: willRemove, didRemove: didRemove)
             }
             r.freedBytes = r.removedItems.reduce(Int64(0)) { $0 + (sizes[$1] ?? 0) }
             return r
@@ -369,7 +375,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         var settingsWritten = true
         if resetSettings {
-            progress(.settings)
+            let removedItems = Set(report.removedItems)
+            progress(.settings, Set(steps.filter { !removedItems.contains($0.item) }.map(\.category)))
             effects.removeDefaults(domain: "com.sageathor.rhemion.app")
             var fresh = AppSettings()
             if !clearExport {
@@ -467,6 +474,26 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// A click on the Dock icon (the app is pinned there, or a window put the icon up): Rhemion is a
     /// menu-bar app with no window of its own at rest, so AppKit's default does nothing visible. Bring
     /// Welcome forward while it is open, otherwise open the hub (or bring a minimized/hidden one back).
+    enum LaunchKind: Equatable {
+        case loginItem, byUser, unknown
+        var label: String {
+            switch self { case .loginItem: "login item"; case .byUser: "by the user"; case .unknown: "unknown (no launch event)" }
+        }
+    }
+
+    /// How this process was started, read from the launch Apple event: a login item start carries
+    /// keyAELaunchedAsLogInItem in its 'oapp' event; any other 'oapp'/'odoc' is a user launch. No event
+    /// (started by a script or debugger) counts as unknown and stays quiet like a login item.
+    @MainActor static func launchKind() -> LaunchKind {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent,
+              event.eventClass == AEEventClass(kCoreEventClass) else { return .unknown }
+        if event.eventID == AEEventID(kAEOpenApplication),
+           event.paramDescriptor(forKeyword: AEKeyword(keyAEPropData))?.enumCodeValue == OSType(keyAELaunchedAsLogInItem) {
+            return .loginItem
+        }
+        return .byUser
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if let welcome = onboardingWindow, welcome.isShowing { welcome.bringToFront() } else { hubWindow?.show() }
         return true
@@ -900,14 +927,16 @@ final class AppController: NSObject, NSApplicationDelegate {
             client?.send(.downloadModel(id: self.modelDownload.modelID))
         }
         modelDownload.onCancel = { [weak client] in client?.send(.cancelModelDownload) }
+        let perf = DictationPerf()   // per-dictation latency by phase → `perf:` lines in app.log
         client.onEvent = { [weak client, weak self, inputMethod] event in
             // Per-tick microphone levels aren't logged (dozens a second while dictating); state changes are.
             if case .level = event {} else { log("event: \(eventLabel(event))") }
             switch event {
-            case .started:        Task { @MainActor in indicator.recording() }
+            case .started:        perf.markStarted(); Task { @MainActor in indicator.recording() }
             case .level(let rms): Task { @MainActor in indicator.onLevel(rms); self?.hotkey?.onLevel(rms) }
-            case .stopped:        Task { @MainActor in indicator.processing() }
-            case .canceled:       Task { @MainActor in indicator.hide() }
+            case .stopped:        perf.markStopped(); Task { @MainActor in indicator.processing() }
+            case let .transcript(_, ms, _): perf.markTranscript(engineMS: ms)
+            case .canceled:       perf.cancel(); Task { @MainActor in indicator.hide() }
             case .error:          Task { @MainActor in indicator.error() }
             case let .devices(models, mics): Task { @MainActor in self?.updateDevices(models: models, mics: mics) }
             case let .modelDownload(_, state, fraction, error):
@@ -950,6 +979,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                     }
                 }
             case let .deliver(session, text, original, targetPid):
+                perf.markDeliver()
                 // Hop to the main actor to check the barrier (dataOps is @MainActor-isolated; this
                 // closure runs on RuntimeClient's internal queue), same pattern as every other case here.
                 Task { @MainActor in
@@ -963,6 +993,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                         sendAck: { s, status in client?.send(.deliverResult(session: s, status: status)) },
                         onResult: { status in
                             log("delivery: \(status)")
+                            perf.markInserted(method: "\(status)")
                             let ok = isDeliverySuccess(status)
                             Task { @MainActor in if ok { indicator.done() } else { indicator.error() } }
                         }
@@ -1001,6 +1032,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                 return
             }
             log("PTT down -> start (pid \(pid))")
+            perf.markPress()
             recordingFlag.value = true
             client?.send(.start(pressedAt: nil, targetPid: Int(pid)))
         }
@@ -1010,6 +1042,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             let blocked = MainActor.assumeIsolated { self?.dataOps.inProgress ?? false }
             guard !blocked else { log("PTT ignored: data operation in progress"); return }
             log("PTT up -> stop")
+            perf.markRelease()
             client?.send(.stop)
         }
         hotkey.onCountdown = { remaining in Task { @MainActor in indicator.countdown(remaining) } }
@@ -1035,10 +1068,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         //     dictionary the runtime hot-reloads.
         let dictAddPanel = DictAddPanelController()
         let dictAdd = DictAdd()
-        dictAdd.onTrigger = { [weak self] selection in
+        dictAdd.onTrigger = { [weak self] selection, target in
             Task { @MainActor in
                 guard let self, !self.dataOps.inProgress else { return }
-                self.dictAddPanel?.show(heard: selection)
+                self.dictAddPanel?.show(heard: selection, target: target)
             }
         }
         dictAdd.setHotkeys(settings.dictAddHotkeys)
@@ -1145,7 +1178,15 @@ final class AppController: NSObject, NSApplicationDelegate {
             modelDownload: modelDownload,
             onMicrophoneGranted: { [weak self] in self?.restartRuntimeForMicrophone() }
         )
-        onboardingWindow?.showIfNeeded()
+        let launch = Self.launchKind()
+        log("launch: \(launch.label)")
+        if onboardingWindow?.needsShowing == true {
+            onboardingWindow?.show()
+        } else if launch == .byUser {
+            // Started by the user (Dock icon, Finder, Spotlight): show something, as any app does. A login
+            // item start stays quiet in the menu bar.
+            hubWindow?.show()
+        }
         watchForMicrophoneGrant()
 
         // Testing hook: RHEMION_OPEN_HUB=1 pops the hub on launch so it can be shown without clicking the
@@ -1186,6 +1227,17 @@ umask(0o077)
 // Writing to a socket whose peer (the runtime) has gone raises SIGPIPE, whose default action kills the
 // process; ignore it so the client reconnects instead of crashing.
 signal(SIGPIPE, SIG_IGN)
+
+// SIGTERM (`kill`, a launchd stop) would end the process without applicationWillTerminate, leaving the
+// runtime behind. Turn it into a normal quit, which stops the runtime first; the runtime also exits on
+// its own when it sees its parent gone.
+signal(SIGTERM, SIG_IGN)
+let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+sigtermSource.setEventHandler {
+    log("SIGTERM: quitting")
+    NSApp.terminate(nil)
+}
+sigtermSource.resume()
 
 // One Rhemion at a time: a second launch brings the running one forward and quits here — before
 // the runtime starts or any state is touched.

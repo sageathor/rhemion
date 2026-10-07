@@ -19,6 +19,9 @@ final class ModelDownloadModel: ObservableObject {
     }
     @Published var phase: Phase = .checking
 
+    /// Shown when the model is on disk but cannot be loaded; Retry downloads it again, replacing the files.
+    static let damagedMessage = "Speech model couldn't be loaded"
+
     /// The default multilingual model we provision on first run.
     let modelID = "parakeet-v3"
     let approxSizeMB = 460
@@ -34,12 +37,16 @@ final class ModelDownloadModel: ObservableObject {
     func devicesUpdated(_ models: [ModelOption]) {
         let option = models.first { $0.id == modelID }
         let found = option?.found ?? false
-        let present: Phase = found ? ((option?.warm ?? true) ? .ready : .preparing) : .missing
+        let present: Phase = !found ? .missing
+            : (option?.damaged ?? false) ? .failed(Self.damagedMessage)
+            : (option?.warm ?? true) ? .ready : .preparing
         switch phase {
         case .checking, .missing, .preparing, .ready:
             phase = present
+        case .failed(let message) where message == Self.damagedMessage:
+            phase = present                    // a damage report follows the runtime's view, both ways
         case .downloading, .failed:
-            break                              // don't clobber an in-flight download or a shown error
+            break                              // don't clobber an in-flight download or a download error
         }
     }
 
@@ -92,7 +99,7 @@ struct SpeechModelStatus: View {
             HStack(spacing: 8) {
                 Text(message).font(RhemionStyle.font(11)).foregroundStyle(RhemionStyle.danger)
                     .lineLimit(1).truncationMode(.tail)
-                actionButton("Retry") { model.onDownload() }
+                actionButton(message == ModelDownloadModel.damagedMessage ? "Download again" : "Retry") { model.onDownload() }
             }
         }
     }

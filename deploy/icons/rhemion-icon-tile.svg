@@ -2,11 +2,11 @@
   <!-- Rhemion app icon on the classic macOS grid: the full-bleed art scaled into the 824 tile (radius 185). -->
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#2B2B2F"/><stop offset=".55" stop-color="#242426"/><stop offset="1" stop-color="#1E1E20"/></linearGradient>
-    <linearGradient id="orb" x1="0" y1="337.9" x2="0" y2="686.1" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#F7C862"/><stop offset="1" stop-color="#E29F2E"/></linearGradient>
+    <linearGradient id="orb" x1="0" y1="337.9" x2="0" y2="686.1" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#E9E9EE"/></linearGradient>
     <clipPath id="tile"><rect x="100" y="100" width="824" height="824" rx="185" ry="185"/></clipPath>
   </defs>
   <g clip-path="url(#tile)"><g transform="translate(100 100) scale(0.8046875)">
     <rect width="1024" height="1024" fill="url(#bg)"/>
-    <circle cx="512" cy="512" r="240.6" fill="none" stroke="#EDB43A" stroke-width="43.0" opacity="1.000"/><circle cx="512" cy="512" r="332.6" fill="none" stroke="#EDB43A" stroke-width="32.8" opacity="0.615"/><circle cx="512" cy="512" r="427.3" fill="none" stroke="#EDB43A" stroke-width="26.8" opacity="0.423"/>
+    <circle cx="512" cy="512" r="240.6" fill="none" stroke="#FFFFFF" stroke-width="43.0" opacity="1.000"/><circle cx="512" cy="512" r="332.6" fill="none" stroke="#FFFFFF" stroke-width="32.8" opacity="0.615"/><circle cx="512" cy="512" r="427.3" fill="none" stroke="#FFFFFF" stroke-width="26.8" opacity="0.423"/>
     <circle cx="512" cy="512" r="174.1" fill="url(#orb)"/></g></g>
 </svg>

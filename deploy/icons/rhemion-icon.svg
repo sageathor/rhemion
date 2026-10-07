@@ -1,12 +1,12 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
-  <!-- Rhemion app icon, full-bleed 1024 square (no mask, no drawn light): G3, three rings by the loudness law
+  <!-- Rhemion app icon, full-bleed 1024 square (no mask, no drawn light): G3 monochrome (white mark, chosen 06.10.2026), three rings by the loudness law
        (closer to the source = louder), on the app's dark-theme ground. Source for Icon Composer. -->
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#2B2B2F"/><stop offset=".55" stop-color="#242426"/><stop offset="1" stop-color="#1E1E20"/></linearGradient>
-    <linearGradient id="orb" x1="0" y1="337.9" x2="0" y2="686.1" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#F7C862"/><stop offset="1" stop-color="#E29F2E"/></linearGradient>
+    <linearGradient id="orb" x1="0" y1="337.9" x2="0" y2="686.1" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#E9E9EE"/></linearGradient>
   </defs>
   <g transform="translate(0 0) scale(1.0)">
     <rect width="1024" height="1024" fill="url(#bg)"/>
-    <circle cx="512" cy="512" r="240.6" fill="none" stroke="#EDB43A" stroke-width="43.0" opacity="1.000"/><circle cx="512" cy="512" r="332.6" fill="none" stroke="#EDB43A" stroke-width="32.8" opacity="0.615"/><circle cx="512" cy="512" r="427.3" fill="none" stroke="#EDB43A" stroke-width="26.8" opacity="0.423"/>
+    <circle cx="512" cy="512" r="240.6" fill="none" stroke="#FFFFFF" stroke-width="43.0" opacity="1.000"/><circle cx="512" cy="512" r="332.6" fill="none" stroke="#FFFFFF" stroke-width="32.8" opacity="0.615"/><circle cx="512" cy="512" r="427.3" fill="none" stroke="#FFFFFF" stroke-width="26.8" opacity="0.423"/>
     <circle cx="512" cy="512" r="174.1" fill="url(#orb)"/></g>
 </svg>

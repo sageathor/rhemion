@@ -33,7 +33,7 @@ public enum IPCCodec {
             if let error { tail += #","error":\#(jsonString(error))"# }
             obj = #"{"event":"model-download","id":\#(jsonString(id)),"state":\#(jsonString(state))\#(tail)}"#
         case .devices(let models, let mics):
-            let m = jsonArray(models.map { ["id": $0.id, "label": $0.label, "engine": $0.engine, "found": $0.found, "warm": $0.warm] })
+            let m = jsonArray(models.map { ["id": $0.id, "label": $0.label, "engine": $0.engine, "found": $0.found, "warm": $0.warm, "damaged": $0.damaged] })
             let d = jsonArray(mics.map { ["uid": $0.uid, "name": $0.name, "built_in": $0.builtIn] })
             obj = #"{"event":"devices","models":\#(m),"mics":\#(d)}"#
         }
@@ -162,7 +162,8 @@ public enum IPCCodec {
                 let models = (obj["models"] as? [[String: Any]] ?? []).compactMap { m -> ModelOption? in
                     guard let id = m["id"] as? String, let label = m["label"] as? String,
                           let engine = m["engine"] as? String, let found = m["found"] as? Bool else { return nil }
-                    return ModelOption(id: id, label: label, engine: engine, found: found, warm: m["warm"] as? Bool ?? true)
+                    return ModelOption(id: id, label: label, engine: engine, found: found, warm: m["warm"] as? Bool ?? true,
+                                       damaged: m["damaged"] as? Bool ?? false)
                 }
                 let mics = (obj["mics"] as? [[String: Any]] ?? []).compactMap { d -> MicOption? in
                     guard let uid = d["uid"] as? String, let name = d["name"] as? String,
