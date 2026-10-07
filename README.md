@@ -47,7 +47,7 @@ The name comes from *rhēma*, Greek for the spoken word.
 
 Rhemion is signed with its own certificate but is **not notarized by Apple**, which requires a paid Apple Developer membership. macOS therefore asks you to confirm it once, on first launch.
 
-1. Download `Rhemion-3.0.0.zip` from the [latest release](https://github.com/sageathor/rhemion/releases/latest).
+1. Download the `Rhemion-<version>.zip` file from the [latest release](https://github.com/sageathor/rhemion/releases/latest).
 2. Open the ZIP and move `Rhemion.app` to the **Applications** folder. Launch it from there, not from Downloads.
 3. Open Rhemion. macOS reports that it cannot verify the app. Click **Done**.
 4. Open **System Settings › Privacy & Security**, scroll to **Security**, click **Open Anyway** next to the Rhemion message, and confirm with your password or Touch ID.
@@ -69,7 +69,7 @@ Rhemion uses them for nothing else. See [PRIVACY.md](PRIVACY.md).
 Each release lists the SHA-256 checksum of the ZIP. In Terminal:
 
 ```sh
-shasum -a 256 ~/Downloads/Rhemion-3.0.0.zip
+shasum -a 256 ~/Downloads/Rhemion-*.zip
 ```
 
 The output must match the checksum on the release page.
