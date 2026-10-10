@@ -19,6 +19,7 @@ final class UndoStore: @unchecked Sendable {
         let pid: Int             // where it landed
         let at: CFTimeInterval
         let undoRaw: String?     // boundary-spaced pre-dictionary text to restore (nil = no substitution)
+        var session: String? = nil   // the runtime session of the take (the Journal marks an erased take)
     }
     private var armed: Armed?
     private var ttl: CFTimeInterval = 8   // a reversal older than this is no longer "the last thing typed"
@@ -29,10 +30,10 @@ final class UndoStore: @unchecked Sendable {
     /// Arm from a confirmed delivery. `deliveredN` is the grapheme count of the delivered text; `pid`
     /// is where it landed; `undoRaw` is the boundary-spaced original to paste back on undo-replace, or
     /// nil when this delivery was not a dictionary substitution (still deletable via double-Esc).
-    func arm(deliveredN: Int, pid: Int, undoRaw: String?) {
+    func arm(deliveredN: Int, pid: Int, undoRaw: String?, session: String? = nil) {
         guard deliveredN > 0 else { disarm(); return }
         lock.lock()
-        armed = Armed(deliveredN: deliveredN, pid: pid, at: CACurrentMediaTime(), undoRaw: undoRaw)
+        armed = Armed(deliveredN: deliveredN, pid: pid, at: CACurrentMediaTime(), undoRaw: undoRaw, session: session)
         lock.unlock()
     }
 
@@ -50,6 +51,12 @@ final class UndoStore: @unchecked Sendable {
     /// landed in `pid`. Returns the delivered grapheme count (how many Backspaces erase it), cleared
     /// one-shot on a match; clears and returns nil if expired; on a pid mismatch leaves it armed (so
     /// the user can refocus the original app and retry within the TTL) and returns nil.
+    /// `takeDelete` plus the take's session, so the Journal can mark the entry as Erased.
+    func takeDeleteWithSession(matchingPid pid: Int) -> (Int, String?)? {
+        lock.lock(); let session = armed?.session; lock.unlock()
+        return takeDelete(matchingPid: pid).map { ($0, session) }
+    }
+
     func takeDelete(matchingPid pid: Int) -> Int? {
         lock.lock(); defer { lock.unlock() }
         guard let a = armed else { return nil }

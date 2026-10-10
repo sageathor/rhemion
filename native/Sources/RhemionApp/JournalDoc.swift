@@ -17,6 +17,24 @@ struct JournalEntry: Identifiable, Sendable, Equatable {
     let audio: String?
     let audioRetained: Bool?
     let preDictionary: String?
+    /// The runtime session (3.1 entries only): the key of the press-time target for Insert again.
+    var session: String? = nil
+    var deliveryError: String? = nil
+
+    /// What the Journal marks on this entry (3.1). Not inserted: the text exists but never landed; Failed: no text.
+    /// Canceled: stopped with Esc twice and kept (the runtime journals it with the error `canceled`).
+    /// Erased: inserted, then taken back with Esc twice (marked by the app, see JournalMarks).
+    /// Journal only (Shift with the dictation key) is not delivered on purpose and carries no mark.
+    enum Status: Sendable, Equatable { case notInserted, failed, canceled, erased }
+    var status: Status? {
+        if delivered { return nil }
+        if deliveryError == "journal-only" { return nil }   // dictated to the journal on purpose (Shift): nothing to flag
+        if deliveryError == "canceled" { return .canceled }
+        return transcript.contains(where: { !$0.isWhitespace }) ? .notInserted : .failed
+    }
+
+    /// Dictated with Shift to the journal only (3.1): never inserted, so no app goes with it.
+    var isJournalOnly: Bool { deliveryError == "journal-only" }
 
     // enhanced wins only when it has real non-whitespace text (empty/blank enhanced falls back to clean,
     // matching RecallStore) — else Final would show/copy an empty string.
@@ -90,7 +108,8 @@ struct JournalDoc: Sendable {
                     deliveryMethod: object["delivery_method"] as? String,
                     appName: object["app_name"] as? String, appBundleID: object["app_bundle_id"] as? String,
                     audio: object["audio"] as? String, audioRetained: object["audio_retained"] as? Bool,
-                    preDictionary: object["pre_dictionary"] as? String))
+                    preDictionary: object["pre_dictionary"] as? String,
+                    session: object["session"] as? String, deliveryError: object["delivery_error"] as? String))
             }
         }
         entries.sort { $0.ts == $1.ts ? $0.id > $1.id : $0.ts > $1.ts }

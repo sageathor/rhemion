@@ -45,10 +45,25 @@ final class HotkeyTap: @unchecked Sendable {
         for name in names { if let m = Self.modBits[name] { device |= m.dev; logical |= m.logical } }
         pttDeviceMask = device
         otherModsMask = Self.allLogical & ~logical
+        journalModLogical = Self.journalModifier(for: names)?.logical ?? 0
     }
 
-    /// Called (on the main run loop) when PTT engages; carries the frontmost app's pid at press.
-    var onStart: (@Sendable (Int32) -> Void)?
+    /// The modifier that turns a press into Journal only (3.1): Shift, unless Shift is itself a dictation key,
+    /// then Control, then Option (the first one not used to dictate). Nil when all three are dictation keys.
+    static func journalModifier(for names: [String]) -> (logical: UInt64, symbol: String, name: String)? {
+        let used = names.compactMap { modBits[$0]?.logical }.reduce(0, |)
+        let order: [(UInt64, String, String)] = [(0x20000, "⇧", "Shift"), (0x40000, "⌃", "Control"), (0x80000, "⌥", "Option")]
+        return order.first { used & $0.0 == 0 }.map { (logical: $0.0, symbol: $0.1, name: $0.2) }
+    }
+    private var journalModLogical: UInt64 = 0x20000
+    /// Settings › Shortcuts (3.1): a second quick tap latches hands-free; Shift (or its stand-in) makes it Journal
+    /// only. Off: a quick tap is just a short take, and the modifier is ignored (an ordinary dictation).
+    var handsFreeEnabled = true
+    var journalOnlyEnabled = true
+
+    /// Called (on the main run loop) when PTT engages; carries the frontmost app's pid at press, and whether
+    /// Shift was held with the key (3.1 Journal only: the text goes to the journal, nothing is inserted).
+    var onStart: (@Sendable (Int32, Bool) -> Void)?
     /// Called (on the main run loop) when PTT releases (or a missed release self-heals).
     var onStop: (@Sendable () -> Void)?
     /// Called on the main run loop while latched hands-free is silent: `remaining` shrinks 1→0 as the
@@ -63,6 +78,10 @@ final class HotkeyTap: @unchecked Sendable {
 
     private var handsfree = false, pending = false
     private var pttWasDown = false          // previous PTT-bit state, to act on the down/up EDGE only
+    /// When a key was last typed anywhere (main run loop).
+    private(set) var lastKeyDownAt: CFTimeInterval = 0
+    private var latchStopT: CFTimeInterval = -1   // when a tap stopped hands-free (a second tap right after is part of it)
+    private var swallowRelease = false            // that second tap's release must not count either
     private var pressT: CFTimeInterval = 0
     private var lastLevel = 0.0, silAccum = 0.0
     private var pendingTimer: Timer?, silTimer: Timer?
@@ -146,6 +165,7 @@ final class HotkeyTap: @unchecked Sendable {
         }
         let flags = event.flags.rawValue
         if type == .keyDown {
+            lastKeyDownAt = CACurrentMediaTime()   // the typing pause a pinned "insert and come back" waits for
             // Self-heal a missed/coalesced release (only when NOT latched): a keyDown while we think
             // we're held but the PTT modifier is up means the release event was lost.
             if held && !handsfree && (flags & pttDeviceMask) == 0 { pttWasDown = false; doStop() }
@@ -157,9 +177,17 @@ final class HotkeyTap: @unchecked Sendable {
         let pressed = pttDown && !pttWasDown
         let released = !pttDown && pttWasDown
         pttWasDown = pttDown
-        let otherHeld = (flags & otherModsMask) != 0
+        // The Journal-only modifier alone alongside the key (Shift, or its stand-in when Shift dictates; 3.1) =
+        // Journal only; any other modifier = a normal hotkey, not dictation.
+        let others = flags & otherModsMask
+        let journalModAlone = journalModLogical != 0 && others == journalModLogical
+        let journalOnly = journalModAlone && journalOnlyEnabled
+        let otherHeld = others != 0 && !journalModAlone
         if pressed {
-            if handsfree { doStop(); return }                          // a tap while latched = stop
+            // A double tap to leave hands-free (the natural "stop" gesture): the first tap stops, the second
+            // one must not start a new take (it used to, and its instant cancel hid the result).
+            if handsfree { doStop(); latchStopT = CACurrentMediaTime(); return }   // a tap while latched = stop
+            if CACurrentMediaTime() - latchStopT < Self.dblWindow { latchStopT = -1; swallowRelease = true; return }
             if pending {                                               // second tap in the window = latch hands-free
                 pending = false; pendingTimer?.invalidate(); pendingTimer = nil
                 handsfree = true
@@ -169,13 +197,14 @@ final class HotkeyTap: @unchecked Sendable {
             if !held && !otherHeld {                                   // key alone = dictation; key+mod = a normal hotkey
                 held = true
                 pressT = CACurrentMediaTime()
-                beginDictation()
+                beginDictation(journalOnly: journalOnly)
             }
         } else if released {
+            if swallowRelease { swallowRelease = false; return }       // release of the swallowed second tap
             if handsfree { return }                                    // release of the latching tap: stay latched
             guard held else { return }
             held = false
-            if CACurrentMediaTime() - pressT >= Self.tapMax {
+            if CACurrentMediaTime() - pressT >= Self.tapMax || !handsFreeEnabled {
                 doStop()                                               // a hold: normal momentary stop
             } else {
                 pending = true                                         // a quick tap: wait for a possible second tap
@@ -198,11 +227,11 @@ final class HotkeyTap: @unchecked Sendable {
         return timer
     }
 
-    private func beginDictation() {
+    private func beginDictation(journalOnly: Bool) {
         let pid = MainActor.assumeIsolated {   // the tap's run-loop source is on the main run loop
             NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
         }
-        onStart?(pid)
+        onStart?(pid, journalOnly)
     }
 
     /// Abort an in-progress recording WITHOUT emitting `onStop` — used by the double-Esc cancel

@@ -7,6 +7,7 @@ Rhemion is built so that what you say stays on your Mac.
 - Audio is captured only while you dictate: while the key is held, or while hands-free recording is on.
 - Recognition runs on your Mac. Audio and text are not sent anywhere.
 - The recognized text is inserted into the focused field. When Rhemion pastes it, it puts the previous clipboard content back afterwards, unless another app has changed the clipboard in the meantime. The pasted text is marked so that clipboard managers can skip it.
+- A dictation you cancel with Esc twice is kept in the Journal for 24 hours, so a cancel by mistake can be brought back, and then deleted. You can turn this off or change how long in Settings › Journal. Recordings shorter than a second are never kept.
 
 ## What is stored, and where
 

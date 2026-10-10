@@ -69,27 +69,8 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         permissions.startPolling()
         AppController.shared?.setDockIconVisible(true)
         NSApp.activate(ignoringOtherApps: true)
-        if let window, !window.isVisible { centerOnScreen(window) }
+        if let window, !window.isVisible { centerOnPointerScreen(window) }
         window?.makeKeyAndOrderFront(nil)
-    }
-
-    /// Place the window in the true middle of the screen the user is on (the one under the pointer — where
-    /// they just clicked the menu bar item). The size is settled first: with .preferredContentSize the
-    /// SwiftUI content sizes the window only on layout, so centering before that used a stale size. (Plain
-    /// NSWindow.center() also sits deliberately above the middle.)
-    private func centerOnScreen(_ window: NSWindow) {
-        if let view = window.contentViewController?.view {
-            view.layoutSubtreeIfNeeded()
-            let fit = view.fittingSize
-            if fit.width > 0, fit.height > 0 { window.setContentSize(fit) }
-        }
-        let mouse = NSEvent.mouseLocation
-        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) ?? NSScreen.main else {
-            window.center(); return
-        }
-        let area = screen.visibleFrame, size = window.frame.size
-        window.setFrameOrigin(NSPoint(x: (area.midX - size.width / 2).rounded(),
-                                      y: (area.midY - size.height / 2).rounded()))
     }
 
     /// Called once on launch: show the Welcome on first run, and again whenever a permission Rhemion needs

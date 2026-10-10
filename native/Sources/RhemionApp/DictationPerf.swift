@@ -8,8 +8,10 @@
 //   release→stopped key up → the runtime has closed the capture
 //   →transcript    capture closed → text recognized (engine = the recognizer's own time inside it)
 //   →deliver       transcript → the app gets the final text (dictionary replacements applied)
-//   →inserted      the app gets the text → the insertion call returned
-//   total          key up → inserted: the number to keep low
+//   →visible       the app gets the text → the text is in the field (the AX write returned / ⌘V posted)
+//   →inserted      the app gets the text → the insertion call returned (includes the after-check)
+//   felt           key up → visible: the number to keep low (what the user waits for)
+//   total          key up → inserted (kept for comparison with earlier lines)
 //
 // deploy/latency-report.sh turns these lines into p50/p95 per phase. Hands-free takes that stop on their
 // own have no key-up; their "release" is the stop event, so total covers stopped → inserted.
@@ -19,7 +21,7 @@ import Foundation
 final class DictationPerf: @unchecked Sendable {
     private let lock = NSLock()
     private var pressed: UInt64?, started: UInt64?, released: UInt64?, stopped: UInt64?
-    private var transcript: UInt64?, delivered: UInt64?
+    private var transcript: UInt64?, delivered: UInt64?, visible: UInt64?
     private var engineMS: Int?
 
     private static func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
@@ -34,6 +36,8 @@ final class DictationPerf: @unchecked Sendable {
     func markStopped() { lock.withLock { stopped = Self.now() } }
     func markTranscript(engineMS ms: Double) { lock.withLock { transcript = Self.now(); engineMS = Int(ms) } }
     func markDeliver() { lock.withLock { delivered = Self.now() } }
+    /// The text reached the field at `at` (uptime ns): the AX write returned or ⌘V was posted.
+    func markVisible(at: UInt64) { lock.withLock { if visible == nil { visible = at } } }
     func cancel()      { lock.withLock { reset() } }
 
     /// The insertion finished: write the line and forget this dictation.
@@ -49,7 +53,9 @@ final class DictationPerf: @unchecked Sendable {
                 parts.append("→transcript \(v)" + (engineMS.map { " (engine \($0))" } ?? ""))
             }
             if let v = Self.ms(transcript, delivered) { parts.append("→deliver \(v)") }
+            if let v = Self.ms(delivered, visible) { parts.append("→visible \(v)") }
             if let v = Self.ms(delivered, end) { parts.append("→inserted \(v)") }
+            if let v = Self.ms(from, visible) { parts.append("felt \(v)") }
             if let v = Self.ms(from, end) { parts.append("total \(v)") }
             if let v = Self.ms(started, stopped) { parts.append("audio \(v)") }
             parts.append(method)
@@ -60,7 +66,7 @@ final class DictationPerf: @unchecked Sendable {
     }
 
     private func reset() {
-        pressed = nil; started = nil; released = nil; stopped = nil; transcript = nil; delivered = nil
+        pressed = nil; started = nil; released = nil; stopped = nil; transcript = nil; delivered = nil; visible = nil
         engineMS = nil
     }
 }

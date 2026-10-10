@@ -184,6 +184,10 @@ let deliveryPipeline: @Sendable (String, String) async -> DeliveryOutcome? = { _
 // the settings snapshot may only gain after startup (the client may import it post-login).
 let history = HistoryStore()
 
+// Audio insurance (3.1): files created before this moment may be takes the previous runtime left behind.
+let runtimeStartedAt = Date()
+HistoryStore.orphanCutoff = runtimeStartedAt
+
 let service = RuntimeService(
     coordinator: SessionCoordinator(),
     metrics: metrics,
@@ -217,7 +221,11 @@ let service = RuntimeService(
         }
         return (models: models, mics: mics)
     },
-    modelDownloader: RuntimeService.fluidDownloader(replace: { startupDamaged.isSet })
+    modelDownloader: RuntimeService.fluidDownloader(replace: { startupDamaged.isSet }),
+    speechCheck: { wav in
+        guard let samples = try? WAVReader.readInt16Mono16k(wav) else { return false }
+        return AudioGate.worthTranscribing(samples)
+    }
 )
 
 // Dictation explicitly uses failTake (also the coordinator default). The retarget policy is
@@ -258,6 +266,17 @@ if let warmEngine = engineRegistry.engine(id: startupModelID) {
 Task.detached(priority: .utility) {
     let stateDir = RuntimePaths.stateDirectory(), historyDir = RuntimePaths.historyDirectory()
     let startupMonth = HistoryStore.month(Date())
+    // Recover interrupted takes FIRST: the reconcile below deletes recordings no journal row points at.
+    let interrupted = SpoolRecovery.collect(historyDirectory: historyDir, stateDirectory: stateDir,
+                                            knownIDs: await history.knownIDs(), startedAt: runtimeStartedAt)
+    if !interrupted.isEmpty {
+        logToStderr("[spool] recovering \(interrupted.count) interrupted take(s)")
+        await service.recoverInterruptedTakes(interrupted)
+    }
+    // Then clear recordings no journal row points at, in every month (recovery has taken what it could).
+    let swept = await history.sweepOrphanAudio(createdBefore: runtimeStartedAt,
+                                               inProgressOlderThan: runtimeStartedAt.addingTimeInterval(-SpoolRecovery.maxAge))
+    if swept > 0 { logToStderr("[history] removed \(swept) orphan recording(s)") }
     if await history.reconcile(month: startupMonth) == nil {
         logToStderr("history startup reconcile failed for \(startupMonth)")
     }

@@ -35,6 +35,10 @@ struct AppSettings: Equatable, Sendable {
     var audioRetentionUnit: String = "days"        // days | weeks | months
     var transcriptRetentionValue: Int = 0
     var transcriptRetentionUnit: String = "months" // days | weeks | months
+    // 3.1: a recording cancelled with Esc twice is kept in the Journal (as Canceled) for this long, so a cancel
+    // by mistake can be brought back. Under a second is never kept (an accidental press).
+    var keepCanceled: Bool = true                  // (UI: switch)
+    var keepCanceledHours: Int = 24                // (UI: stepper)
 
     @MainActor func applyAppearance() {
         NSApp.appearance = theme == "light" ? NSAppearance(named: .aqua)
@@ -53,6 +57,13 @@ struct AppSettings: Equatable, Sendable {
     var dictAddHotkeys: [String] = ["cmd+option+w"]    // dict-add chords, any fires (UI: recorder rows)
     // Cmd+Option+Shift+L by default.
     var undoHotkeys: [String] = ["cmd+option+shift+l"] // undo-replace chords, any fires (UI: recorder rows)
+    // 3.1 Pin to this window: the chord pins / unpins (Cmd+Option+P by default); "stay" brings the pinned window
+    // forward when dictation starts, "return" inserts there and comes back; optional auto-unpin after N minutes.
+    var pinHotkeys: [String] = ["cmd+option+p"]        // (UI: recorder rows)
+    var pinMode: String = "stay"                       // stay | return   (UI)
+    var pinAutoUnpin: Bool = false                     // (UI: switch)
+    var pinAutoUnpinMinutes: Int = 30                  // (UI: stepper)
+    static let pinModeOptions = ["stay", "return"]
     // How long the last delivered take stays reversible — governs BOTH undo-replace and double-Esc
     // delete (they share one armed record). Labeled "Reversal window" in the UI.
     var undoTTLSecs: Int = 8                       // (UI: stepper)
@@ -64,6 +75,13 @@ struct AppSettings: Equatable, Sendable {
     // countdown; auto-stop at N+M.
     var handsfreeCountdownAfterSecs: Int = 30
     var handsfreeCountdownSecs: Int = 10
+
+    // 3.1 Shortcuts: every gesture can be switched off, and double Esc can be left to chosen apps.
+    var handsFreeEnabled: Bool = true              // tap the dictation key twice    (UI: switch)
+    var escCancelEnabled: Bool = true              // Esc twice while recording      (UI: switch)
+    var escEraseEnabled: Bool = true               // Esc twice right after          (UI: switch)
+    var journalOnlyEnabled: Bool = true            // Shift with the dictation key   (UI: switch)
+    var escExceptionApps: [String] = []            // bundle IDs where Esc twice goes to the app (UI: app rows)
 
     // Allowed sets (also the UI option lists).
     static let languageOptions     = ["auto", "ru", "en"]
@@ -93,6 +111,8 @@ enum SettingsStore {
         s.indicatorStyle = oneof(object["indicator_style"], s.indicatorStyle, ["auto", "notch", "floating"])
         s.exportInitialized = object["export_initialized"] as? Bool ?? false
         s.audioRetentionValue      = num(object["history_audio_retention_value"], s.audioRetentionValue)
+        s.keepCanceled             = bool(object["journal_keep_canceled"], s.keepCanceled)
+        s.keepCanceledHours        = num(object["journal_keep_canceled_hours"], s.keepCanceledHours)
         s.audioRetentionUnit       = oneof(object["history_audio_retention_unit"], s.audioRetentionUnit, AppSettings.retentionUnitOptions)
         s.transcriptRetentionValue = num(object["history_transcript_retention_value"], s.transcriptRetentionValue)
         s.transcriptRetentionUnit  = oneof(object["history_transcript_retention_unit"], s.transcriptRetentionUnit, AppSettings.retentionUnitOptions)
@@ -107,12 +127,21 @@ enum SettingsStore {
         s.pttKeys                   = keyList(object["general_ptt_keys"], object["general_ptt_key"], s.pttKeys, AppSettings.pttKeyOptions)
         s.inputMethod               = oneof(object["general_input_method"], s.inputMethod, AppSettings.inputMethodOptions)
         s.recallHotkeys             = specList(object["general_recall_hotkeys"], object["general_recall_hotkey"], s.recallHotkeys)
+        s.pinHotkeys                = specList(object["general_pin_hotkeys"], nil, s.pinHotkeys)
+        s.pinMode                   = oneof(object["general_pin_mode"], s.pinMode, AppSettings.pinModeOptions)
+        s.pinAutoUnpin              = bool(object["general_pin_auto_unpin"], s.pinAutoUnpin)
+        s.pinAutoUnpinMinutes       = num(object["general_pin_auto_unpin_minutes"], s.pinAutoUnpinMinutes)
         s.dictAddHotkeys            = specList(object["general_dict_add_hotkeys"], object["general_dict_add_hotkey"], s.dictAddHotkeys)
         s.undoHotkeys               = specList(object["general_undo_replace_hotkeys"], object["general_undo_replace_hotkey"], s.undoHotkeys)
         s.undoTTLSecs               = num(object["undo_ttl_secs"], s.undoTTLSecs)
         s.escDoubleTapMS            = num(object["general_esc_double_tap_ms"], s.escDoubleTapMS)
         s.handsfreeCountdownAfterSecs = num(object["handsfree_countdown_after_secs"], s.handsfreeCountdownAfterSecs)
         s.handsfreeCountdownSecs      = num(object["handsfree_countdown_secs"], s.handsfreeCountdownSecs)
+        s.handsFreeEnabled            = bool(object["shortcuts_hands_free"], s.handsFreeEnabled)
+        s.escCancelEnabled            = bool(object["shortcuts_esc_cancel"], s.escCancelEnabled)
+        s.escEraseEnabled             = bool(object["shortcuts_esc_erase"], s.escEraseEnabled)
+        s.journalOnlyEnabled          = bool(object["shortcuts_journal_only"], s.journalOnlyEnabled)
+        s.escExceptionApps            = (object["shortcuts_esc_exception_apps"] as? [String] ?? s.escExceptionApps).filter { !$0.isEmpty }
         return s
     }
 
@@ -143,6 +172,8 @@ enum SettingsStore {
         object["theme"] = s.theme
         object["indicator_style"] = s.indicatorStyle
         object["history_audio_retention_value"]      = s.audioRetentionValue
+        object["journal_keep_canceled"]              = s.keepCanceled
+        object["journal_keep_canceled_hours"]        = s.keepCanceledHours
         object["history_audio_retention_unit"]       = s.audioRetentionUnit
         object["history_transcript_retention_value"] = s.transcriptRetentionValue
         object["history_transcript_retention_unit"]  = s.transcriptRetentionUnit
@@ -158,6 +189,15 @@ enum SettingsStore {
         object["general_ptt_key"]              = s.pttKeys.first ?? "right_option"   // legacy mirror (downgrade safety)
         object["general_input_method"]         = s.inputMethod
         object["general_recall_hotkeys"]       = s.recallHotkeys
+        object["general_pin_hotkeys"]          = s.pinHotkeys
+        object["general_pin_mode"]             = s.pinMode
+        object["general_pin_auto_unpin"]       = s.pinAutoUnpin
+        object["shortcuts_hands_free"]         = s.handsFreeEnabled
+        object["shortcuts_esc_cancel"]         = s.escCancelEnabled
+        object["shortcuts_esc_erase"]          = s.escEraseEnabled
+        object["shortcuts_journal_only"]       = s.journalOnlyEnabled
+        object["shortcuts_esc_exception_apps"] = s.escExceptionApps
+        object["general_pin_auto_unpin_minutes"] = s.pinAutoUnpinMinutes
         object["general_dict_add_hotkeys"]     = s.dictAddHotkeys
         object["general_undo_replace_hotkeys"] = s.undoHotkeys
         // Legacy single-string mirrors so a downgrade to a pre-multi-binding build still reads a hotkey.

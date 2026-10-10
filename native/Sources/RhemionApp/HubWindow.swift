@@ -102,6 +102,9 @@ final class HubModel: ObservableObject {
 final class HubWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private let model: HubModel
+    var journal: JournalModel { model.journal }
+    /// Open Settings on a category (Keyboard Shortcuts… opens Shortcuts).
+    func selectSettings(_ category: SettingsCategory) { model.settingsCategory = category }
 
     init(current: @escaping () -> AppSettings, apply: @escaping (AppSettings) -> Void,
          beginRecording: @escaping () -> Void, endRecording: @escaping () -> Void,
@@ -161,7 +164,7 @@ final class HubWindowController: NSObject, NSWindowDelegate {
         model.dictionary.reload()   // and the Dictionary (picks up ⌘⌥W quick-adds)
         AppController.shared?.setDockIconVisible(true)   // Dock icon + Cmd-Tab while the window is up
         NSApp.activate(ignoringOtherApps: true)
-        window?.center()
+        if let window, !window.isVisible { centerOnPointerScreen(window, fitContent: false) }   // opened, not moved when already up
         window?.makeKeyAndOrderFront(nil)
         log("hub window shown")
     }

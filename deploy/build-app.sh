@@ -46,6 +46,7 @@ for f in "$FLUID"/ThirdPartyLicenses/*; do cp "$f" "$LICENSES/FluidAudio-$(basen
 # App icon: one icon (no light/dark choice); the compiled .icns is the bundle's icon for Finder/Dock/Cmd-Tab.
 cp "$ROOT"/deploy/icons/AppIcon.icns     "$APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT"/deploy/icons/MenuBarGlyph.png "$APP/Contents/Resources/MenuBarGlyph.png"  # monochrome tray glyph (template)
+cp "$ROOT"/RELEASE-NOTES.md "$APP/Contents/Resources/RELEASE-NOTES.md"  # What's New reads this version's entry
 # macOS 26 (Liquid Glass): the layered Icon Composer source deploy/icons/AppIcon.icon compiled into Assets.car,
 # picked up through CFBundleIconName. macOS 15, and a build without full Xcode (no actool), use AppIcon.icns.
 ICON_TMP="$SCRATCH/icon-compile"; rm -rf "$ICON_TMP"; mkdir -p "$ICON_TMP"

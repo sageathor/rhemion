@@ -10,6 +10,69 @@ import SwiftUI
 final class JournalModel: ObservableObject {
     @Published var doc = JournalDoc(entries: [], skippedLines: 0, unreadableFiles: 0)
     @Published var loading = false
+    enum InsertAgainOutcome { case inserted, fieldGone, failed }
+    /// 3.1 Insert again, wired by the AppController: whether this entry can be put back (its press-time target
+    /// is still known) and the action, which reports how it went.
+    var canInsertAgain: (JournalEntry) -> Bool = { _ in false }
+    /// How long a canceled entry is kept (Settings › Journal); shown in its status row.
+    var keepCanceledHours = 24
+    var insertAgain: ((JournalEntry, @escaping @MainActor (InsertAgainOutcome) -> Void) -> Void)?
+    /// Entries put back with Insert again: no longer marked (kept across launches in the state folder).
+    @Published private(set) var insertedAgain: Set<String> = InsertedAgainStore.load()
+    /// Entries whose field could not be found when Insert again was tried (this session).
+    @Published private(set) var fieldGone: Set<String> = []
+    func status(_ e: JournalEntry) -> JournalEntry.Status? {
+        if insertedAgain.contains(e.id) { return nil }
+        if e.delivered, let s = e.session, JournalMarks.mark(session: s) == "erased" { return .erased }
+        return e.status
+    }
+    /// Statuses whose text can be put back with Insert again.
+    func canPutBack(_ e: JournalEntry) -> Bool {
+        guard let s = status(e), s != .failed, e.transcript.contains(where: { !$0.isWhitespace }) else { return false }
+        return canInsertAgain(e)
+    }
+    /// Entries with an Insert again in flight: a second click does nothing until the first one finished.
+    @Published private(set) var inserting: Set<String> = []
+    func runInsertAgain(_ e: JournalEntry) {
+        guard !inserting.contains(e.id) else { return }
+        inserting.insert(e.id)
+        insertAgain?(e) { [weak self] outcome in
+            guard let self else { return }
+            self.inserting.remove(e.id)
+            switch outcome {
+            case .inserted: self.insertedAgain.insert(e.id); InsertedAgainStore.save(self.insertedAgain)
+            case .fieldGone: self.fieldGone.insert(e.id)
+            case .failed: break
+            }
+        }
+    }
+    /// 3.1 Recognize again, wired by the AppController: asks the runtime to recognise a Failed entry's recording
+    /// again. The answer arrives as `recognized(id:ok:error:)`.
+    var recognizeAgain: ((JournalEntry) -> Void)?
+    /// Entries being recognised again right now, and the last failure per entry (this session).
+    @Published private(set) var recognizing: Set<String> = []
+    @Published private(set) var recognizeErrors: [String: String] = [:]
+    /// A Failed entry, or a Canceled one whose recognition failed (no text), with its recording kept.
+    func canRecognizeAgain(_ e: JournalEntry) -> Bool {
+        guard let s = status(e), s == .failed || s == .canceled, recognizeAgain != nil, e.audioURL != nil else { return false }
+        return !e.transcript.contains(where: { !$0.isWhitespace })
+    }
+    func runRecognizeAgain(_ e: JournalEntry) {
+        guard !recognizing.contains(e.id), let recognizeAgain else { return }
+        recognizing.insert(e.id); recognizeErrors[e.id] = nil
+        recognizeAgain(e)
+        // A runtime that went away never answers: give the button back after a generous wait.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.recognizing.contains(e.id) else { return }
+                self.recognized(id: e.id, ok: false, error: "It took too long. Try again.")
+            }
+        }
+    }
+    func recognized(id: String, ok: Bool, error: String?) {
+        recognizing.remove(id)
+        if ok { reload() } else { recognizeErrors[id] = error ?? "It could not be recognised again." }
+    }
     private var refresh: Task<Void, Never>?
     private var reloadPending = false
     func reload() {
@@ -21,6 +84,90 @@ final class JournalModel: ObservableObject {
             refresh = nil
             if reloadPending { reloadPending = false; reload() }
         }
+    }
+}
+
+/// Marks the app sets on entries by runtime session (3.1: "erased" when a take is taken back with Esc twice),
+/// in `<stateDir>/journal-marks.json`. Written from any thread; small, read-modify-write under a lock.
+enum JournalMarks {
+    private static let lock = NSLock()
+    private static var url: URL { AppPaths.stateDir.appendingPathComponent("journal-marks.json") }
+    private nonisolated(unsafe) static var cache: [String: String]?
+    private static func load() -> [String: String] {
+        if let cache { return cache }
+        let m = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode([String: String].self, from: $0) } ?? [:]
+        cache = m; return m
+    }
+    static func mark(session: String) -> String? { lock.lock(); defer { lock.unlock() }; return load()[session] }
+    static func add(session: String, mark: String) {
+        lock.lock(); defer { lock.unlock() }
+        var m = load(); m[session] = mark; cache = m
+        if let data = try? JSONEncoder().encode(m) { try? data.write(to: url, options: .atomic) }
+    }
+}
+
+/// Entry ids put back with Insert again, in `<stateDir>/journal-inserted-again.json`.
+enum InsertedAgainStore {
+    private static var url: URL { AppPaths.stateDir.appendingPathComponent("journal-inserted-again.json") }
+    static func load() -> Set<String> {
+        guard let data = try? Data(contentsOf: url), let ids = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+        return Set(ids)
+    }
+    static func save(_ ids: Set<String>) {
+        if let data = try? JSONEncoder().encode(ids.sorted()) { try? data.write(to: url, options: .atomic) }
+    }
+}
+
+/// The Journal's status marks (mono): a ring, and what is inside it is what happened.
+/// Not inserted = the orb held by its ring (the notch's kept frame), Failed = the empty ring. Drawn in the
+/// row's ink; 12-unit geometry scaled to `size`.
+struct JournalStatusMark: View {
+    let status: JournalEntry.Status
+    var size: CGFloat = 11
+    var body: some View {
+        Canvas { ctx, sz in
+            let k = sz.width / 12, c = CGPoint(x: sz.width / 2, y: sz.height / 2)
+            func circle(_ r: CGFloat) -> Path { Path(ellipseIn: CGRect(x: c.x - r * k, y: c.y - r * k, width: 2 * r * k, height: 2 * r * k)) }
+            switch status {
+            case .notInserted:
+                ctx.stroke(circle(4.9), with: .foreground, lineWidth: 1.3 * k)
+                ctx.fill(circle(2.5), with: .foreground)
+            case .failed:
+                ctx.stroke(circle(4.4), with: .foreground, lineWidth: 1.3 * k)
+            case .canceled, .erased:   // the ring with a cross (you stopped it) or a line (you took it back)
+                ctx.stroke(circle(4.9), with: .foreground, lineWidth: 1.3 * k)
+                var p = Path()
+                if status == .canceled {
+                    p.move(to: CGPoint(x: c.x - 1.9 * k, y: c.y - 1.9 * k)); p.addLine(to: CGPoint(x: c.x + 1.9 * k, y: c.y + 1.9 * k))
+                    p.move(to: CGPoint(x: c.x + 1.9 * k, y: c.y - 1.9 * k)); p.addLine(to: CGPoint(x: c.x - 1.9 * k, y: c.y + 1.9 * k))
+                } else {
+                    p.move(to: CGPoint(x: c.x - 2.3 * k, y: c.y)); p.addLine(to: CGPoint(x: c.x + 2.3 * k, y: c.y))
+                }
+                ctx.stroke(p, with: .foreground, style: StrokeStyle(lineWidth: 1.3 * k, lineCap: .round))
+            }
+        }.frame(width: size, height: size).accessibilityHidden(true)
+    }
+}
+
+/// Insert again's icon ("Into the line"): an arrow entering a line of text. 16-unit geometry.
+struct InsertAgainIcon: View {
+    var size: CGFloat = 13
+    var body: some View {
+        Canvas { ctx, sz in
+            let k = sz.width / 16
+            var p = Path()
+            p.move(to: CGPoint(x: 2.5 * k, y: 3.5 * k)); p.addLine(to: CGPoint(x: 13.5 * k, y: 3.5 * k))
+            p.move(to: CGPoint(x: 2.5 * k, y: 12.5 * k)); p.addLine(to: CGPoint(x: 13.5 * k, y: 12.5 * k))
+            p.move(to: CGPoint(x: 4 * k, y: 8 * k)); p.addLine(to: CGPoint(x: 10.5 * k, y: 8 * k))
+            p.move(to: CGPoint(x: 8.5 * k, y: 5.8 * k)); p.addLine(to: CGPoint(x: 10.8 * k, y: 8 * k)); p.addLine(to: CGPoint(x: 8.5 * k, y: 10.2 * k))
+            ctx.stroke(p, with: .foreground, style: StrokeStyle(lineWidth: 1.5 * k, lineCap: .round, lineJoin: .round))
+        }.frame(width: size, height: size).accessibilityHidden(true)
+    }
+}
+
+extension JournalEntry.Status {
+    var label: String {
+        switch self { case .notInserted: return "Not inserted"; case .failed: return "Failed"; case .canceled: return "Canceled"; case .erased: return "Erased" }
     }
 }
 
@@ -40,7 +187,7 @@ private enum JournalStyle {
     static func line(_ dark: Bool) -> Color { Color(journalHex: dark ? 0x37373B : 0xE5E5E9) }
     static func line2(_ dark: Bool) -> Color { Color(journalHex: dark ? 0x2C2C30 : 0xEFEFF2) }       // hover fill (--line2)
     static func selected(_ dark: Bool) -> Color { dark ? gold.opacity(0.20) : Color(journalHex: 0xF6DD84) }
-    static func cbBorder(_ dark: Bool) -> Color { dark ? Color.white.opacity(0.28) : Color.black.opacity(0.24) }   // --cb-border from the mockup
+    static func cbBorder(_ dark: Bool) -> Color { dark ? Color.white.opacity(0.28) : Color.black.opacity(0.24) }
     static func font(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
         // Use the EXACT bundled Mulish face for each weight (no SwiftUI weight synthesis, which rendered
         // heavier than the design). Falls back to the native macOS font if the face isn't registered.
@@ -110,7 +257,7 @@ struct JournalView: View {
                                 listWidth = max(280, min(geometry.size.width - 385, (dragWidth ?? listWidth) + value.translation.width))
                             }.onEnded { _ in dragWidth = nil })
                         Group {
-                            if let selected { JournalDetail(entry: selected, notify: notify, delete: { requestDelete([selected.id]) }, deleting: deleting).id(selected.id) }
+                            if let selected { JournalDetail(entry: selected, model: model, notify: notify, delete: { requestDelete([selected.id]) }, deleting: deleting).id(selected.id) }
                             else { Text("Select an entry").foregroundStyle(JournalStyle.secondary(dark)).frame(maxWidth: .infinity, maxHeight: .infinity) }
                         }.frame(minWidth: 290, maxWidth: .infinity, maxHeight: .infinity).background(JournalStyle.content(dark))
                     }
@@ -253,7 +400,8 @@ struct JournalView: View {
     }
     private func rows(_ values: [JournalEntry]) -> some View {
         ForEach(Array(values.enumerated()), id: \.element.id) { index, entry in
-            JournalRow(entry: entry, compact: compact && search.isEmpty, query: search,
+            JournalRow(entry: entry, status: model.status(entry), canInsertAgain: model.canPutBack(entry),
+                       insertAgain: { model.runInsertAgain(entry) }, compact: compact && search.isEmpty, query: search,
                        selected: opened == entry.id, checked: checked.contains(entry.id), selecting: !checked.isEmpty, hovered: hovered == entry.id,
                        separator: index + 1 < values.count && opened != values[index + 1].id && hovered != values[index + 1].id,
                        open: { opened = entry.id }, toggle: { if !checked.insert(entry.id).inserted { checked.remove(entry.id) } }, copy: {
@@ -322,7 +470,7 @@ struct JournalView: View {
     }
 }
 
-/// A 30×30 toolbar icon toggle matching the mockup's `.icon-toggle`: neutral gray chip when active,
+/// A 30×30 toolbar icon toggle in the icon-toggle style: neutral gray chip when active,
 /// gray (`--line2`) on hover — never an accent tint (it sits quietly next to the window chrome).
 private struct JournalToolbarToggle: View {
     let systemImage: String
@@ -506,7 +654,7 @@ struct JournalCheckbox: View {
     private var dark: Bool { scheme == .dark }
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 3.5).fill(on || mixed ? JournalStyle.gold : .clear)   // unchecked = no fill (mockup)
+            RoundedRectangle(cornerRadius: 3.5).fill(on || mixed ? JournalStyle.gold : .clear)   // unchecked = no fill
             RoundedRectangle(cornerRadius: 3.5).strokeBorder(on || mixed ? JournalStyle.gold : JournalStyle.cbBorder(dark), lineWidth: 1)
             if on || mixed { Image(systemName: mixed ? "minus" : "checkmark").font(.system(size: 9, weight: .bold)).foregroundStyle(.white) }
         }.frame(width: 15, height: 15)
@@ -515,6 +663,9 @@ struct JournalCheckbox: View {
 }
 private struct JournalRow: View {
     let entry: JournalEntry
+    let status: JournalEntry.Status?
+    let canInsertAgain: Bool
+    let insertAgain: () -> Void
     let compact: Bool
     let query: String
     let selected: Bool
@@ -551,6 +702,9 @@ private struct JournalRow: View {
                     if compact {
                         HStack(spacing: 8) {
                             Text(JournalDoc.label(entry.ts, "HH:mm")).font(JournalStyle.font(11.5, .medium)).foregroundStyle(JournalStyle.secondary(dark))
+                            if let status {   // compact: the mark alone, the word in the tooltip
+                                JournalStatusMark(status: status).foregroundStyle(selected ? JournalStyle.text(dark) : JournalStyle.secondary(dark)).help(status.label)
+                            }
                             Text(preview).font(JournalStyle.font(13, .light)).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                             Text(entry.duration).font(JournalStyle.font(11)).foregroundStyle(JournalStyle.tertiary(dark))
                         }
@@ -560,7 +714,14 @@ private struct JournalRow: View {
                             HStack(spacing: 5) {
                                 Text(JournalDoc.label(entry.ts, query.isEmpty ? "HH:mm" : "dd.MM.yyyy · HH:mm"))
                                 Text("·")
-                                Text(entry.appName ?? "Unknown app").lineLimit(1)
+                                // Where it went: the app, or "Journal only" as plain text in the same place.
+                                Text(entry.isJournalOnly ? "Journal only" : (entry.appName ?? "Unknown app")).lineLimit(1)
+                                if let status {
+                                    HStack(spacing: 4) {
+                                        JournalStatusMark(status: status)
+                                        Text(status.label).font(JournalStyle.font(11, .semibold)).lineLimit(1)
+                                    }.foregroundStyle(selected ? JournalStyle.text(dark) : JournalStyle.secondary(dark)).padding(.leading, 4)
+                                }
                                 Spacer(minLength: 0)
                                 Text(entry.duration)
                             }.font(JournalStyle.font(11)).foregroundStyle(JournalStyle.tertiary(dark))
@@ -568,8 +729,14 @@ private struct JournalRow: View {
                     }
                 }.contentShape(Rectangle())
             }.buttonStyle(.plain)
-            Button(action: copy) { Image(systemName: "doc.on.doc").font(.system(size: 12, weight: .regular)).foregroundStyle(JournalStyle.tertiary(dark)).frame(width: 18, height: 18) }
-                .opacity(hovered ? 1 : 0).allowsHitTesting(hovered).help("Copy (Final)")
+            if canInsertAgain {
+                Button(action: insertAgain) { InsertAgainIcon(size: 13).foregroundStyle(JournalStyle.tertiary(dark)).frame(width: 18, height: 18) }
+                    .buttonStyle(.plain).opacity(hovered ? 1 : 0).allowsHitTesting(hovered).help("Insert again: put it back in the field where you dictated it")
+            }
+            if status != .failed, entry.transcript.contains(where: { !$0.isWhitespace }) {   // nothing to copy without text
+                Button(action: copy) { Image(systemName: "doc.on.doc").font(.system(size: 12, weight: .regular)).foregroundStyle(JournalStyle.tertiary(dark)).frame(width: 18, height: 18) }
+                    .opacity(hovered ? 1 : 0).allowsHitTesting(hovered).help("Copy (Final)")
+            }
         }.monospacedDigit().padding(.horizontal, 8).padding(.vertical, compact ? 6 : 8)
             .background(selected ? JournalStyle.selected(dark) : hovered ? JournalStyle.line(dark).opacity(0.6) : .clear, in: RoundedRectangle(cornerRadius: 6))
             .overlay { if !compact && !selected { RoundedRectangle(cornerRadius: 6).strokeBorder(JournalStyle.line(dark), lineWidth: 0.5).allowsHitTesting(false) } }
@@ -581,6 +748,7 @@ private struct JournalRow: View {
 
 private struct JournalDetail: View {
     let entry: JournalEntry
+    @ObservedObject var model: JournalModel
     let notify: (String) -> Void
     let delete: () -> Void
     let deleting: Bool
@@ -600,7 +768,7 @@ private struct JournalDetail: View {
                 HStack(spacing: 8) {
                     modeSwitcher
                     Spacer(minLength: 8)
-                    Text(entry.appName ?? "—").font(JournalStyle.font(11)).lineLimit(1).foregroundStyle(JournalStyle.tertiary(dark))
+                    Text(entry.isJournalOnly ? "Journal only" : (entry.appName ?? "—")).font(JournalStyle.font(11)).lineLimit(1).foregroundStyle(JournalStyle.tertiary(dark))
                     Button { info.toggle() } label: { Image(systemName: "info.circle") }.help("How it was recognized")
                         .background(GeometryReader { g in Color.clear.preference(key: InfoAnchorKey.self, value: g.frame(in: .named("detailRoot"))) })
                     JournalActionButton(title: "Copy", systemImage: "doc.on.doc") {
@@ -614,6 +782,8 @@ private struct JournalDetail: View {
             Divider().overlay(JournalStyle.line(dark))
             // SCROLL body — transcript, player, and the (deliberate, destructive) Delete at the bottom.
             ScrollView {
+              VStack(alignment: .leading, spacing: 0) {
+                if let status = model.status(entry) { statusRow(status); Divider().overlay(JournalStyle.line(dark)) }
                 VStack(alignment: .leading, spacing: 20) {
                     // Selectable transcript in a read-only NSTextView so the selection highlight is OUR gold,
                     // not the system blue accent (SwiftUI's .textSelection can't recolor its highlight).
@@ -628,11 +798,86 @@ private struct JournalDetail: View {
                         JournalQuietAction(title: "Delete", systemImage: "trash", color: RhemionStyle.danger, action: delete).disabled(deleting)
                     }
                 }.padding(24)
+              }
             }
         }
         .coordinateSpace(name: "detailRoot")
         .onPreferenceChange(InfoAnchorKey.self) { infoAnchor = $0 }
         .overlay { infoPanel }
+    }
+
+    /// The status row: the mark and the state as a title line, the reason
+    /// under it (fixed sentences, nothing filled in), Insert again on the right when the entry can be put back.
+    private func statusRow(_ status: JournalEntry.Status) -> some View {
+        let gone = model.fieldGone.contains(entry.id)
+        let canPutBack = !gone && model.canPutBack(entry) && !model.inserting.contains(entry.id)
+        let canRecognize = model.canRecognizeAgain(entry)
+        let recognizing = model.recognizing.contains(entry.id)
+        return HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 7) {
+                    JournalStatusMark(status: status, size: 13)
+                    Text(status.label).font(JournalStyle.font(13, .semibold))
+                }.foregroundStyle(JournalStyle.text(dark))
+                Text(reason(status, gone: gone)).font(JournalStyle.font(12.5)).foregroundStyle(JournalStyle.secondary(dark))
+                    .lineSpacing(3).padding(.leading, 20).fixedSize(horizontal: false, vertical: true)
+                if let error = model.recognizeErrors[entry.id], canRecognize {
+                    Text(error).font(JournalStyle.font(12.5)).foregroundStyle(JournalStyle.text(dark))
+                        .lineSpacing(3).padding(.leading, 20).fixedSize(horizontal: false, vertical: true)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+            if canRecognize {
+                Button { model.runRecognizeAgain(entry) } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "waveform").font(.system(size: 12, weight: .medium))
+                        Text(recognizing ? "Recognizing…" : "Recognize again")
+                    }.font(JournalStyle.font(12, .medium))
+                        .foregroundStyle(recognizing ? JournalStyle.secondary(dark) : JournalStyle.text(dark))
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(JournalStyle.win(dark), in: RoundedRectangle(cornerRadius: 8))
+                        .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(JournalStyle.line(dark), lineWidth: 0.5) }
+                        .shadow(color: .black.opacity(dark ? 0.22 : 0.06), radius: 1.5, y: 1)
+                }.buttonStyle(.plain).disabled(recognizing).help("Recognize the kept recording again")
+            }
+            if canPutBack {
+                Button { model.runInsertAgain(entry) } label: {
+                    HStack(spacing: 6) { InsertAgainIcon(size: 13); Text("Insert again") }.font(JournalStyle.font(12, .medium))
+                        .foregroundStyle(JournalStyle.text(dark))
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(JournalStyle.win(dark), in: RoundedRectangle(cornerRadius: 8))
+                        .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(JournalStyle.line(dark), lineWidth: 0.5) }
+                        .shadow(color: .black.opacity(dark ? 0.22 : 0.06), radius: 1.5, y: 1)
+                }.buttonStyle(.plain).help("Put it back in the field where you dictated it")
+            }
+        }.padding(.horizontal, 24).padding(.vertical, 14)
+    }
+
+    private func reason(_ status: JournalEntry.Status, gone: Bool) -> String {
+        if gone { return "The field it was meant for is no longer there. Copy the text and paste it where it should go." }
+        switch status {
+        case .notInserted:
+            switch entry.deliveryError {
+            case "target-lost": return "Focus moved elsewhere before the text was ready."
+            case "recovered": return "Rhemion stopped before this dictation finished. It was recognised from the recording afterwards, so it was not inserted."
+            case "recognized-again": return "Recognised again from the recording. It has not been inserted anywhere yet."
+            default: return "It could not be inserted where you were typing."
+            }
+        case .failed:
+            let kept = entry.audioURL != nil ? " The recording is kept below." : ""
+            switch entry.deliveryError {
+            case "recovered": return "Rhemion stopped before this dictation finished, and it could not be recognised afterwards.\(kept)"
+            case "recognition-failed": return "Recognition failed, so there is no text.\(kept)"
+            default: return "Speech wasn’t recognised, so there is no text.\(kept)"
+            }
+        case .canceled:
+            let until = entry.ts.addingTimeInterval(Double(max(1, model.keepCanceledHours)) * 3600)
+            let f = DateFormatter()   // system wording and translation: "tomorrow at 11:52", "Wednesday at 9:05"
+            f.doesRelativeDateFormatting = true; f.dateStyle = .medium; f.timeStyle = .short
+            f.formattingContext = .middleOfSentence
+            return "Stopped with Esc twice. Kept until \(f.string(from: until))."
+        case .erased:
+            return "Taken back with Esc twice right after it was inserted."
+        }
     }
 
     // Final / Clean / Raw — a segmented control (active = raised win pill + soft shadow, thin text).

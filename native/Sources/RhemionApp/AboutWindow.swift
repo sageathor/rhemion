@@ -8,11 +8,14 @@ import SwiftUI
 final class AboutWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private let logoClock = WelcomeLogoClock()
+    /// Opens What's New (the link on the version line).
+    var onWhatsNew: (() -> Void)?
 
     func show() {
         if window == nil {
             let root = AboutView(info: AboutInfo(bundle: .main), logoClock: logoClock,
-                                 onClose: { [weak self] in self?.window?.close() })
+                                 onClose: { [weak self] in self?.window?.close() },
+                                 onWhatsNew: { [weak self] in self?.onWhatsNew?() })
             let hosting = NSHostingController(rootView: root)
             hosting.sizingOptions = [.preferredContentSize]
             let window = NSWindow(contentViewController: hosting)
@@ -28,8 +31,7 @@ final class AboutWindowController: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         if let window, !window.isVisible {
             logoClock.restart()
-            window.layoutIfNeeded()
-            window.center()
+            centerOnPointerScreen(window)
         }
         window?.makeKeyAndOrderFront(nil)
     }
@@ -69,6 +71,7 @@ struct AboutView: View {
     let info: AboutInfo
     @ObservedObject var logoClock: WelcomeLogoClock
     let onClose: () -> Void
+    var onWhatsNew: (() -> Void)? = nil
     @Environment(\.colorScheme) private var scheme
     @State private var copied = false
     private var dark: Bool { scheme == .dark }
@@ -129,6 +132,7 @@ struct AboutView: View {
             }
             .buttonStyle(QuietHoverStyle(dark: dark))
             .help("Copy the version for a bug report")
+            if let onWhatsNew { TextLink(title: "What's New", action: onWhatsNew).padding(.leading, 4) }
         }
     }
 

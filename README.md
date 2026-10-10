@@ -29,7 +29,10 @@ The name comes from *rhēma*, Greek for the spoken word.
 
 - **Push-to-talk.** Right Command by default. Choose another key, or add several; any of them starts dictation.
 - **Hands-free.** Double-tap the key to keep recording, tap once to stop. After a long silence it stops on its own.
-- **Undo in one gesture.** Double-tap Esc to cancel a recording or to erase the text just inserted.
+- **Undo in one gesture.** Double-tap Esc to cancel a recording or to erase the text just inserted. A cancel by mistake waits in the Journal for a day.
+- **Text lands where you started.** If you have moved on by the time the text is ready, it waits in the Journal instead of going into the wrong field, and Insert again puts it back.
+- **Pin to a window.** ⌥⌘P sends every dictation to one window while you work elsewhere.
+- **Journal only.** Hold Shift with the dictation key to save a thought without inserting it.
 - **On-device recognition.** NVIDIA Parakeet v3 running on your Mac through [FluidAudio](https://github.com/FluidInference/FluidAudio). The model (about 460 MB) is downloaded once.
 - **Dictionary.** Teach it the words it keeps getting wrong: "Spoken as → Replace with". Add a word from a selection with ⌥⌘W; undo a replacement with ⇧⌥⌘L.
 - **Recall.** ⌥⌘R inserts the last dictation again.

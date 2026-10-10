@@ -74,6 +74,8 @@ public actor RuntimeService {
     /// that session's `.deliver` so the client inserts into the app that was focused when the
     /// dictation began -- not whatever is focused when the async transcript lands.
     private var activeTargetPid: Int?
+    /// The active take was started as Journal only (3.1): its text goes to the journal, never delivered.
+    private var activeJournalOnly = false
     /// Delivery-result continuations, keyed by session: the detached delivery task parks here
     /// after emitting `.deliver`, and the matching `deliver-result` command (or the timeout)
     /// resumes it exactly once. No pre-registration buffer is needed: the delivery task registers
@@ -82,6 +84,14 @@ public actor RuntimeService {
     /// client must receive it and paste first) -- so an ack can never arrive before its waiter.
     /// An ack with no waiter is therefore a late/duplicate/unsolicited one and is dropped.
     private var deliveryWaiters: [String: CheckedContinuation<String?, Never>] = [:]
+    /// Audio insurance (3.1): whether a take's recording holds speech worth recognising (the composition root's
+    /// audio gate). When set, a take whose recognition FAILS on speech is journaled as Failed with its recording
+    /// kept (so it can be recognised again) instead of vanishing, and a recording that will never be journaled
+    /// (canceled, silent, too short) is deleted at once, so the next start's recovery never mistakes it for an
+    /// interrupted take. Nil (tests): the pre-3.1 behaviour, nothing journaled on failure, files left alone.
+    private let speechCheck: (@Sendable (URL) -> Bool)?
+    /// Entries being recognised again right now (one at a time per entry).
+    private var rerecognizing: Set<String> = []
 
     public init(
         coordinator: SessionCoordinator,
@@ -96,6 +106,7 @@ public actor RuntimeService {
             try await AsrModels.download(version: version, progressHandler: progress)
         },
         deliveryResultTimeout: Double = 5.0,
+        speechCheck: (@Sendable (URL) -> Bool)? = nil,
         now: @escaping @Sendable () -> Double = { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 }
     ) {
         self.modelDownloader = modelDownloader
@@ -108,6 +119,7 @@ public actor RuntimeService {
         self.contextProvider = contextProvider
         self.devicesProvider = devicesProvider
         self.deliveryResultTimeout = deliveryResultTimeout
+        self.speechCheck = speechCheck
         self.now = now
     }
 
@@ -116,7 +128,7 @@ public actor RuntimeService {
         let commands = IPCCodec.decodeCommands(from: &buffer)
         for command in commands {
             switch command {
-            case .start(let pressedAt, let targetPid):
+            case .start(let pressedAt, let targetPid), .startJournal(let pressedAt, let targetPid):
                 metrics.record("start_received", session: nil)
                 switch await coordinator.start() {
                 case .started(let id):
@@ -129,6 +141,7 @@ public actor RuntimeService {
                     // IPC hop (it mislabeled e.g. the ChatGPT desktop app as "Google Chrome").
                     activeApplication = contextProvider?(targetPid)
                     activeTargetPid = targetPid
+                    if case .startJournal = command { activeJournalOnly = true } else { activeJournalOnly = false }
                     emit(.started(session: id.raw), to: reply)
                     // pressedAt from the client (real hotkey-press time, client clock) when
                     // present, else the server's own receipt time. The two clocks are not
@@ -157,11 +170,15 @@ public actor RuntimeService {
                     // Falling back to the start snapshot only matters for injected/non-file sinks.
                     let createdAt = (try? wav?.resourceValues(forKeys: [.creationDateKey]).creationDate)
                         ?? activeCreatedAt ?? Date()
-                    let application = activeApplication
+                    // Journal only (3.1): nothing was inserted anywhere, so no app is recorded with it.
+                    let application = activeJournalOnly ? nil : activeApplication
                     let targetPid = activeTargetPid
+                    let journalOnly = activeJournalOnly
+                    activeJournalOnly = false
                     activeCreatedAt = nil
                     activeApplication = nil
                     activeTargetPid = nil
+                    activeJournalOnly = false
                     if let transcriptProducer, let wav {
                         // Detached: transcription must not block the actor (or this handle
                         // call) from processing further commands. The transcript event still
@@ -171,6 +188,8 @@ public actor RuntimeService {
                             // below). The TRUTH of whether it landed comes separately from the
                             // client's ack, recorded into the history row.
                             var emittedDeliver = false
+                            var recognitionFailed = false
+                            var journaled = false
                             if let result = await transcriptProducer(id.raw, wav) {
                                 // Log the ASR time so a cold reload (e.g. the OS evicted the model
                                 // after idle) is visible as a large transcript_ms vs the warm ~100ms.
@@ -197,7 +216,11 @@ public actor RuntimeService {
                                     var delivered = false
                                     var deliveryMethod = "none"
                                     var deliveryError: String? = nil
-                                    if let finalText, !finalText.isEmpty {
+                                    if let finalText, !finalText.isEmpty, journalOnly {
+                                        // Journal only: saved, never delivered (no `.deliver`, no ack to wait for).
+                                        (delivered, deliveryMethod, deliveryError) = (false, "none", "journal-only")
+                                        journaled = true
+                                    } else if let finalText, !finalText.isEmpty {
                                         await self.emit(.deliver(session: id.raw, text: finalText, original: original, targetPid: targetPid), to: reply)
                                         emittedDeliver = true
                                         // Park until the client reports how the insert landed (or a
@@ -233,6 +256,17 @@ public actor RuntimeService {
                                         await history.append(rec)
                                     }
                                 }
+                            } else if let speechCheck = self.speechCheck {
+                                // No transcript. Speech in the recording means recognition itself failed: journal
+                                // it as Failed with the recording kept (Recognize again in the Journal). Silence
+                                // (the gate's drop) has nothing worth keeping: delete the file.
+                                if speechCheck(wav) {
+                                    recognitionFailed = true
+                                    await self.journalFailedTake(session: id.raw, wav: wav, createdAt: createdAt,
+                                                                 application: application, error: "recognition-failed")
+                                } else {
+                                    Self.discard(wav)
+                                }
                             }
                             // No `.deliver` was emitted at all (an empty/silent take dropped by the
                             // gate, or post-processing emptied it): tell the client so the notch
@@ -241,8 +275,13 @@ public actor RuntimeService {
                             // ASR. (A `.deliver` that was emitted but failed to land is NOT canceled
                             // here -- the client already resolves its own indicator from the paste
                             // result; canceled is only for "there was nothing to deliver".)
-                            if !emittedDeliver {
-                                await self.emit(.canceled(session: id.raw), to: reply)
+                            if recognitionFailed {
+                                // The voice was there but no text came back: the indicator shows the failure.
+                                self.emit(.error(message: "recognition failed"), to: reply)
+                            } else if journaled {
+                                self.emit(.journaled(session: id.raw), to: reply)
+                            } else if !emittedDeliver {
+                                self.emit(.canceled(session: id.raw), to: reply)
                             }
                         }
                     } else {
@@ -254,6 +293,27 @@ public actor RuntimeService {
                 case .rejected(let reason):
                     emit(.error(message: reason), to: reply)
                 }
+            case .cancelKeeping:
+                metrics.record("cancel_keep_received", session: nil)
+                switch await coordinator.stop() {
+                case .stopped(let id):
+                    activeReply = nil
+                    let wav = takeSink?.end(session: id.raw)
+                    let createdAt = (try? wav?.resourceValues(forKeys: [.creationDateKey]).creationDate)
+                        ?? activeCreatedAt ?? Date()
+                    let application = activeApplication
+                    activeCreatedAt = nil
+                    activeApplication = nil
+                    activeTargetPid = nil
+                    activeJournalOnly = false
+                    emit(.canceled(session: id.raw), to: reply)   // the indicator retracts at once, as for a plain cancel
+                    if let transcriptProducer, let wav {
+                        Task { await self.keepCanceled(session: id.raw, wav: wav, createdAt: createdAt,
+                                                       application: application, transcriptProducer: transcriptProducer) }
+                    }
+                case .rejected:
+                    break
+                }
             case .cancel:
                 metrics.record("cancel_received", session: nil)
                 // Abort the active take without delivering. Mirror `.stop`'s session teardown, but
@@ -263,10 +323,13 @@ public actor RuntimeService {
                 switch await coordinator.stop() {
                 case .stopped(let id):
                     activeReply = nil
-                    takeSink?.cancel(session: id.raw)
+                    // A plain cancel keeps nothing: with the insurance on, the finished file goes at once (see speechCheck).
+                    if speechCheck != nil, let wav = takeSink?.end(session: id.raw) { Self.discard(wav) }
+                    else { takeSink?.cancel(session: id.raw) }
                     activeCreatedAt = nil
                     activeApplication = nil
                     activeTargetPid = nil
+                    activeJournalOnly = false
                     emit(.canceled(session: id.raw), to: reply)
                 case .rejected:
                     // Nothing is recording (a race: the take already ended). Stay silent — the
@@ -302,6 +365,14 @@ public actor RuntimeService {
                 catch { emit(.exportCompleted(months: [], error: error.localizedDescription), to: reply) }
             case .ping:
                 emit(.pong, to: reply)
+            case .rerecognize(let entryID):
+                guard !rerecognizing.contains(entryID) else { continue }
+                rerecognizing.insert(entryID)
+                Task {
+                    let (ok, error) = await self.rerecognize(entryID: entryID)
+                    self.finishRerecognize(entryID)
+                    self.emit(.rerecognized(id: entryID, ok: ok, error: error), to: reply)
+                }
             case .downloadModel(let id):
                 startModelDownload(id: id, reply: reply)
             case .cancelModelDownload:
@@ -395,6 +466,110 @@ public actor RuntimeService {
         }
     }
 
+    /// A canceled take that is kept (3.1): recognised off the main path and journaled as not delivered with the
+    /// error `canceled`; never delivered. Takes under a second are accidental presses and are dropped.
+    private func keepCanceled(session: String, wav: URL, createdAt: Date, application: HistoryApplication?,
+                              transcriptProducer: @escaping @Sendable (_ session: String, _ wav: URL) async -> TranscriptResult?) async {
+        let samples = (try? WAVReader.readInt16Mono16k(wav).count) ?? 0
+        let audioDurationMS = Int((Double(samples) / 16_000 * 1_000).rounded())
+        guard audioDurationMS >= 1_000 else {
+            metrics.record("cancel_keep_short_ms=\(audioDurationMS)", session: session)
+            if speechCheck != nil { Self.discard(wav) }
+            return
+        }
+        guard let result = await transcriptProducer(session, wav),
+              result.text.contains(where: { !$0.isWhitespace }) else {
+            // Speech whose recognition failed is kept like any failed take (Canceled, no text, Recognize again);
+            // only silence is dropped.
+            if let speechCheck {
+                if speechCheck(wav) {
+                    await journalFailedTake(session: session, wav: wav, createdAt: createdAt, application: application, error: "canceled")
+                } else { Self.discard(wav) }
+            }
+            return
+        }
+        let outcome = await deliveryPipeline?(session, result.text)
+        guard let history else { return }
+        let stem = wav.deletingPathExtension().lastPathComponent
+        await history.append(HistoryEntry(
+            id: stem.components(separatedBy: "--").last ?? stem, createdAt: createdAt, sessionID: session,
+            engine: result.engineID, audioDurationMS: audioDurationMS, processingDurationMS: Int(result.milliseconds.rounded()),
+            raw: result.text, clean: outcome?.clean ?? result.text, enhanced: outcome?.enhanced,
+            delivered: false, deliveryMethod: "none", deliveryError: "canceled",
+            application: application, audio: wav.lastPathComponent, preDictionary: nil
+        ))
+        metrics.record("cancel_kept", session: session)
+    }
+
+    /// A take with speech whose recognition failed (or a recovered take that could not be recognised): journaled
+    /// with no text, not delivered, its recording kept. The Journal shows it as Failed, with Recognize again.
+    private func journalFailedTake(session: String?, wav: URL, createdAt: Date, application: HistoryApplication?,
+                                   error: String) async {
+        guard let history else { return }
+        let stem = wav.deletingPathExtension().lastPathComponent
+        let samples = (try? WAVReader.readInt16Mono16k(wav).count) ?? 0
+        await history.append(HistoryEntry(
+            id: stem.components(separatedBy: "--").last ?? stem, createdAt: createdAt, sessionID: session ?? "",
+            engine: "none", audioDurationMS: Int((Double(samples) / 16_000 * 1_000).rounded()), processingDurationMS: nil,
+            raw: "", clean: "", enhanced: nil, delivered: false, deliveryMethod: "none", deliveryError: error,
+            application: application, audio: wav.lastPathComponent, preDictionary: nil
+        ))
+        metrics.record("take_failed error=\(error)", session: session)
+    }
+
+    /// Recognise a journal entry's kept recording again and put the text on the entry. The entry stays not
+    /// delivered (the Journal then offers Insert again or Copy).
+    private func rerecognize(entryID: String) async -> (Bool, String?) {
+        guard let store = history as? HistoryStore, let transcriptProducer else { return (false, "Recognition is unavailable.") }
+        guard let wav = await store.audioURL(forEntry: entryID) else { return (false, "The recording is no longer there.") }
+        guard let result = await transcriptProducer("rerecognize", wav),
+              result.text.contains(where: { !$0.isWhitespace }) else {
+            let speech = speechCheck?(wav) ?? true
+            return (false, speech ? "It could not be recognised again." : "No speech was found in the recording.")
+        }
+        let outcome = await deliveryPipeline?("rerecognize", result.text)
+        // A canceled entry stays canceled (it keeps its expiry); any other becomes "recognised again".
+        let wasCanceled = await store.deliveryError(forEntry: entryID) == "canceled"
+        let updated = await store.updateText(id: entryID, HistoryTextUpdate(
+            raw: result.text, clean: outcome?.clean ?? result.text, enhanced: outcome?.enhanced, engine: result.engineID,
+            processingDurationMS: Int(result.milliseconds.rounded()), deliveryError: wasCanceled ? "canceled" : "recognized-again"))
+        metrics.record("rerecognized ok=\(updated) engine=\(result.engineID)", session: nil)
+        return updated ? (true, nil) : (false, "The entry is no longer in the journal.")
+    }
+
+    private func finishRerecognize(_ entryID: String) { rerecognizing.remove(entryID) }
+
+    /// Audio insurance (3.1): recognise and journal the takes the last runtime left behind (see `SpoolRecovery`).
+    /// Each becomes a not-delivered entry marked `recovered` (Failed when it still cannot be recognised); a silent
+    /// or sub-second leftover is deleted.
+    public func recoverInterruptedTakes(_ takes: [URL]) async {
+        guard let transcriptProducer, history != nil else { return }
+        for wav in takes {
+            let samples = (try? WAVReader.readInt16Mono16k(wav).count) ?? 0
+            guard samples >= 16_000, speechCheck?(wav) ?? true else { Self.discard(wav); continue }
+            let createdAt = (try? wav.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
+            guard let result = await transcriptProducer("recovered", wav),
+                  result.text.contains(where: { !$0.isWhitespace }) else {
+                await journalFailedTake(session: nil, wav: wav, createdAt: createdAt, application: nil, error: "recovered")
+                continue
+            }
+            let outcome = await deliveryPipeline?("recovered", result.text)
+            let stem = wav.deletingPathExtension().lastPathComponent
+            await history?.append(HistoryEntry(
+                id: stem.components(separatedBy: "--").last ?? stem, createdAt: createdAt, sessionID: "",
+                engine: result.engineID, audioDurationMS: Int((Double(samples) / 16_000 * 1_000).rounded()),
+                processingDurationMS: Int(result.milliseconds.rounded()),
+                raw: result.text, clean: outcome?.clean ?? result.text, enhanced: outcome?.enhanced,
+                delivered: false, deliveryMethod: "none", deliveryError: "recovered",
+                application: nil, audio: wav.lastPathComponent, preDictionary: nil
+            ))
+            metrics.record("take_recovered", session: nil)
+        }
+    }
+
+    /// Delete a take's recording that will never be journaled.
+    private static func discard(_ wav: URL) { try? FileManager.default.removeItem(at: wav) }
+
     /// Map the client's delivery status word to the truthful history fields. Success words (across
     /// AX insert, synthetic typing, and clipboard paste) mean the text landed; `paste-ambiguous`
     /// likely landed but is flagged; anything else -- and a nil (no ack within the timeout) --
@@ -433,6 +608,7 @@ public actor RuntimeService {
         activeCreatedAt = nil
         activeApplication = nil
         activeTargetPid = nil
+        activeJournalOnly = false
         emit(.error(message: message), to: reply)
     }
 

@@ -21,7 +21,7 @@ The download was probably corrupted, or unpacked by a tool that broke the signat
 ## Nothing happens when I hold the key
 
 - **Accessibility** must be on for Rhemion: System Settings › Privacy & Security › Accessibility. After turning it on, quit Rhemion (⌥⌘Q) and open it again.
-- Check the key in Settings › General › Push-to-talk key. Fn may not work on some external keyboards, so add a second key.
+- Check the key in Settings › Shortcuts › Dictation key. Fn may not work on some external keyboards, so add a second key.
 - The speech model must be downloaded. While it is missing, the menu bar menu shows "Setup incomplete: download model".
 
 ## The text does not appear in the app

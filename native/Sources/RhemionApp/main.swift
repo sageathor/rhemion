@@ -11,148 +11,46 @@ import Foundation
 import RhemionIPC
 import RhemionStorage
 
-/// A compact, PRIVACY-SAFE label for an event — never the transcript/deliver TEXT (only byte counts),
-/// matching the no-content-in-logs rule.
-func eventLabel(_ event: Event) -> String {
-    switch event {
-    case .started(let s): return "started(\(s))"
-    case .stopped(let s): return "stopped(\(s))"
-    case .transcript(let engine, let ms, let text): return "transcript[\(engine) \(Int(ms))ms \(text.utf8.count)b]"
-    case .deliver(let s, let text, _, let pid): return "deliver(\(s) \(text.utf8.count)b pid=\(pid.map(String.init) ?? "-"))"
-    case .error(let m): return "error(\(m))"
-    case .canceled(let s): return "canceled(\(s))"
-    case .exportCompleted(let months, _, let skipped): return "export-completed(\(months.count) skipped=\(skipped.count))"
-    case .historyDeleted(_, let removed, _): return "history-deleted(\(removed.count))"
-    case .pong: return "pong"
-    case .level(let rms): return "level(\(String(format: "%.2f", rms)))"
-    case .devices(let models, let mics): return "devices(models=\(models.count) mics=\(mics.count))"
-    case .modelDownload(let id, let state, let fraction, _):
-        return "model-download(\(id) \(state)\(fraction.map { " \(Int($0 * 100))%" } ?? ""))"
-    }
-}
-
-/// Delivery statuses that mean the text landed (paste-ambiguous is
-/// treated as landed so the indicator doesn't flash an error when the text almost certainly arrived).
-func isDeliverySuccess(_ status: String) -> Bool {
-    switch status {
-    case "inserted-verified", "submitted-unverified", "typed-submitted", "paste-submitted", "paste-ambiguous":
-        return true
-    default:
-        return false
-    }
-}
-
-/// A tiny lock-guarded value: the delivery closure runs on the socket-read queue and must read the
-/// current input method, while the main actor updates it when settings change.
-final class Locked<Value>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stored: Value
-    init(_ value: Value) { stored = value }
-    var value: Value {
-        get { lock.lock(); defer { lock.unlock() }; return stored }
-        set { lock.lock(); stored = newValue; lock.unlock() }
-    }
-}
-
-
-/// Where `log()` may write. A real Uninstall that removes app data turns file logging off right before
-/// deleting the state folder, so no later line (from any thread) recreates app.log after it is gone.
-/// Log hygiene (`LogRotation`, 7 days / 15 MB): enforced at launch, whenever app.log passes its size cap
-/// while writing, and at most once a minute from the write path (which also covers runtime.log, written
-/// by the runtime through an O_APPEND descriptor — rotated by copy + truncate).
-enum AppLog {
-    static let fileDisabled = Locked(false)
-    /// Mirrors `DataOperations.inProgress`, readable from the hygiene timer's utility queue: while a
-    /// storage operation holds the barrier, log hygiene doesn't run — it never races Clear Data's Logs.
-    static let hygienePaused = Locked(false)
-    static let policy = LogRotation.Policy()
-    private static let lock = NSLock()
-    private nonisolated(unsafe) static var lastEnforced = Date.distantPast
-
-    /// The whole policy on the state folder's diagnostic logs, now. Nothing once file logging is off (a
-    /// real Uninstall is removing the state folder) or while a storage operation holds the barrier.
-    static func enforceHygiene() {
-        guard !fileDisabled.value, !hygienePaused.value else { return }
-        lock.lock(); defer { lock.unlock() }
-        enforceLocked(now: Date())
-    }
-
-    private nonisolated(unsafe) static var timer: DispatchSourceTimer?
-
-    /// Every 60 s, off the main thread: runtime.log grows without the app writing a line (the runtime
-    /// writes it directly), so its cap can't wait for the next app.log line.
-    static func startHygieneTimer() {
-        lock.lock(); defer { lock.unlock() }
-        guard timer == nil else { return }
-        let t = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        t.schedule(deadline: .now() + 60, repeating: 60, leeway: .seconds(5))
-        t.setEventHandler { enforceHygiene() }
-        t.resume()
-        timer = t
-    }
-
-    private static func enforceLocked(now: Date) {
-        guard !hygienePaused.value else { return }   // a storage operation holds the barrier
-        lastEnforced = now
-        LogRotation.enforce(in: AppPaths.stateDir, policy: policy, copyTruncate: ["runtime.log"], now: now)
-    }
-
-    /// Appends one line to app.log (created owner-only), rotating when it's due (`hygiene`). `create: false`
-    /// writes only into an app.log that already exists — never creates the state folder or the file: the
-    /// open itself has no O_CREAT, so there is no check-then-act window. A failed open is said on
-    /// stderr (a missing app.log under `create: false` is the expected case and stays quiet).
-    static func append(_ line: String, hygiene: Bool = true, create: Bool = true) {
-        lock.lock(); defer { lock.unlock() }
-        let path = AppPaths.logURL.path
-        if create {
-            try? FileManager.default.createDirectory(at: AppPaths.stateDir, withIntermediateDirectories: true,
-                                                     attributes: [.posixPermissions: 0o700])
-        }
-        let fd = create ? open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0o600) : open(path, O_WRONLY | O_APPEND | O_CLOEXEC)
-        guard fd >= 0 else {
-            let err = errno
-            if create || err != ENOENT {
-                FileHandle.standardError.write(Data("app.log: couldn't open (\(String(cString: strerror(err))))\n".utf8))
-            }
-            return
-        }
-        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        handle.write(Data(line.utf8))
-        let size = (try? handle.seekToEnd()) ?? 0
-        try? handle.close()
-        let now = Date()
-        if hygiene, size > UInt64(policy.maxFileBytes) || now.timeIntervalSince(lastEnforced) > 60 { enforceLocked(now: now) }
-    }
-}
-
-func log(_ message: String) {
-    let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-    let line = stamp + "  " + message + "\n"
-    FileHandle.standardError.write(Data(line.utf8))
-    guard !AppLog.fileDisabled.value else { return }   // stderr only
-    AppLog.append(line)
-}
-
 @MainActor
 final class AppController: NSObject, NSApplicationDelegate {
     static var shared: AppController?
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let supervisor = RuntimeSupervisor()
     var client: RuntimeClient?
-    private var delivery: Delivery?
+    var delivery: Delivery?
     var hotkey: HotkeyTap?
-    private var indicator: NotchIndicator?
+    var indicator: NotchIndicator?
     private var recall: RecallHotkey?
     private var dictAdd: DictAdd?
     private var dictAddPanel: DictAddPanelController?
-    private let undoStore = UndoStore()
+    let undoStore = UndoStore()
     private var undoReplace: UndoReplace?
     private var escGesture: EscapeGesture?
+    /// Settings › Shortcuts for double Esc (3.1), read on the tap's callback: cancel and erase each on or off, and
+    /// apps where Esc twice is left to the app.
+    let escPolicy = Locked<(cancel: Bool, erase: Bool, except: Set<String>)>((true, true, []))
+    func applyShortcutSettings(_ s: AppSettings) {
+        escPolicy.value = (s.escCancelEnabled, s.escEraseEnabled, Set(s.escExceptionApps))
+        hotkey?.handsFreeEnabled = s.handsFreeEnabled
+        hotkey?.journalOnlyEnabled = s.journalOnlyEnabled
+    }
+    var bench: InsertionBench?
+    private var canceledPurgeTimer: Timer?
+    /// "Pin to this window" (3.1): every dictation goes to the pinned window's field.
+    let pin = PinnedWindow()
+    private var pinMenuItem: NSMenuItem?
+    /// Press-time targets by runtime session (the last 100 takes), for the Journal's Insert again.
+    /// The press that started the coming take was Journal only (Shift): read once by its `.started` (3.1).
+    private let journalPress = Locked<Bool>(false)
+    /// Insert again (3.1): the entry's press-time target, keyed by the `again-…` session, so the
+    /// delivery checks the restored field strictly (same element or same field) right before AX or ⌘V.
+    let againTargets = Locked<[String: TargetSnapshot]>([:])
+    let recentTargets = Locked<[String: (at: Date, snap: TargetSnapshot)]>([:])   // developer-only, off unless enabled (deploy/insertion-bench)
     // "The user is actively dictating" — driven by the LOCAL PTT intent (onStart/onStop/abort), NOT by
     // runtime session events, so it can't be clobbered by a late terminal event from an EARLIER,
     // already-processing session, and it flips to false the instant the key is released (before the
     // runtime's `.stopped` round-trips). Read (lock-guarded) from the Esc tap to decide cancel vs erase.
-    private let recordingFlag = Locked<Bool>(false)
+    let recordingFlag = Locked<Bool>(false)
     /// Mirrors `recordingFlag` for DataOperations' "An active dictation will be discarded" copy.
     var isDictatingNow: Bool { recordingFlag.value }
     /// Clear the "actively dictating" flag without sending a stray `.stop` — `abortRecording()` alone
@@ -175,25 +73,33 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// `applicationShouldTerminate` refuses to quit in between (a half-done removal). Every legitimate
     /// exit that happens INSIDE a run* function (Clear Data's settings-reset relaunch) clears it first; the others (restart,
     /// Done, Quit on stuck) run after the function has returned, when it is already down.
-    private var destructiveOpRunning = false
+    var destructiveOpRunning = false
     /// A real (non-dry-run) Uninstall has run — set once `runUninstall` returns from anything but
     /// busy/stuck. From then on every way out goes through `finishUninstall()` (it exits by itself), never
     /// `NSApp.terminate`, which would let AppKit write the just-cleared defaults and saved state back.
-    private var uninstallEnded = false
-    private var settings = AppSettings()
+    var uninstallEnded = false
+    var settings = AppSettings()
     /// Flips to `true` the instant a settings reset's barrier clears (Clear Data with "Reset
     /// all settings", before settings.json is touched) and never back — it always ends in either a
     /// relaunch or a "Restart Rhemion"-only
     /// failure state, never a return to normal operation. Every site that saves `settings` FROM MEMORY
     /// (the hub's apply-on-change, the two onboarding writers) checks this first, so a save racing in
     /// during/after the reset can't resurrect the old settings.json over the fresh one Reset just wrote.
-    private var settingsWriteSuppressed = false
+    var settingsWriteSuppressed = false
     // The runtime's latest answer to `.listDevices` — what the Settings model/mic pickers offer.
     private var availableModels: [ModelOption] = []
     private var availableMics: [MicOption] = []
-    private var hubWindow: HubWindowController?
+    var hubWindow: HubWindowController?
     private var onboardingWindow: OnboardingWindowController?
     private let aboutWindow = AboutWindowController()
+    /// What's New (once after an update; menu bar and About open it again). A login start waits for the user.
+    private var whatsNew: WhatsNewWindowController?
+    private var whatsNewPending = false
+    private func showPendingWhatsNew() {
+        guard whatsNewPending else { return }
+        whatsNewPending = false
+        whatsNew?.show()
+    }
     private var farewellWindow: FarewellWindowController?
     private var clearDataWindow: ClearDataWindowController?
     let modelDownload = ModelDownloadModel()   // speech-model provisioning state (onboarding + settings)
@@ -210,7 +116,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// Watches for a microphone grant made in System Settings while Welcome is closed (stops once granted).
     private var micWatchTimer: Timer?
     private var setupIncompleteItem: NSMenuItem?   // "Setup incomplete — download model", shown only when missing
-    private let inputMethod = Locked<String>("direct")
+    let inputMethod = Locked<String>("direct")
 
     override init() {
         super.init()
@@ -245,6 +151,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         dictionaryItem.target = self
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
+        let shortcutsItem = NSMenuItem(title: "Keyboard Shortcuts…", action: #selector(openShortcuts), keyEquivalent: "/")
+        shortcutsItem.target = self
+        let whatsNewItem = NSMenuItem(title: "What's New…", action: #selector(openWhatsNew), keyEquivalent: "")
+        whatsNewItem.target = self
         let welcomeItem = NSMenuItem(title: "Welcome…", action: #selector(openWelcome), keyEquivalent: "")
         welcomeItem.target = self
         let quitItem = NSMenuItem(title: "Quit Rhemion", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -253,8 +163,16 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(hubItem)
         menu.addItem(setupItem)
         menu.addItem(.separator())
+        // Pin to this window (3.1): the menu-bar menu does not change the frontmost app, so "this window" is the
+        // one the user was in. The shortcut shown is the default global chord.
+        let pinItem = NSMenuItem(title: pin.isPinned ? "Unpin window" : "Pin to this window", action: #selector(togglePin), keyEquivalent: "p")
+        pinItem.keyEquivalentModifierMask = [.command, .option]
+        pinItem.target = self
+        pinMenuItem = pinItem
+        menu.addItem(pinItem)
+        menu.addItem(.separator())
         menu.addItem(journalItem); menu.addItem(dictionaryItem); menu.addItem(.separator())
-        menu.addItem(settingsItem); menu.addItem(welcomeItem); menu.addItem(.separator())
+        menu.addItem(settingsItem); menu.addItem(shortcutsItem); menu.addItem(welcomeItem); menu.addItem(whatsNewItem); menu.addItem(.separator())
         let aboutItem = NSMenuItem(title: "About Rhemion", action: #selector(openAbout), keyEquivalent: "")
         aboutItem.target = self
         menu.addItem(aboutItem)
@@ -295,180 +213,16 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func openSettings() {
+    /// Keyboard Shortcuts… (⌘/, 3.1): Settings opened on Shortcuts, where every keyboard action is listed.
+    @objc func openShortcuts() {
+        hubWindow?.selectSettings(.shortcuts)
+        openSettings()
+    }
+
+    @objc func openSettings() {
         client?.send(.listDevices)   // refresh the model/mic pickers from the runtime on every open
         hubWindow?.show(dest: .settings)   // Settings lives in the hub; ⌘, opens it there
     }
-
-    /// "Clear Data" — quiesce (block input, drop an in-flight take/download, stop the
-    /// runtime and WAIT), delete the chosen categories (`StorageOperations.clearPlan`, off the main
-    /// actor), then resume and stay. The layout is collected AFTER the barrier, so nothing racing in during
-    /// quiesce can stale it — and the result's ticks and freed size come from that plan (
-    /// `OperationReport.clearedRows` / `freedBytes`, each item measured right before it goes). With Exported
-    /// transcripts: exact-match notes are re-adopted first, removed names are forgotten and an emptied
-    /// registry goes. Recordings without the Journal mark the months' log rows `audio_retained: false` first
-    /// and re-render their notes after (`prepareRecordingsRemoval`). With "Reset all settings":
-    /// `settingsWriteSuppressed` flips the instant the barrier clears the defaults domain goes
-    /// and fresh settings are written (export settings carried over unless Exported transcripts is chosen
-    /// too); the barrier then stays up and the pop-up shows the result — its "Restart Rhemion" performs the
-    /// restart (`restartAfterClear()`: no quit mid-progress). A dry run logs "would …" lines and
-    /// resumes instead. `progress` names the pop-up row being deleted now: the plan runs row by row
-    /// (`StorageOperations.clearSteps`), and a settings reset reports its row before it starts.
-    func runClearData(_ selection: Set<ClearItem>,
-                      progress: @escaping @MainActor @Sendable (ClearItem, Set<ClearItem>) -> Void = { _, _ in }) async -> OperationReport {
-        guard !dataOps.inProgress else { return Self.busyReport() }
-        guard await dataOps.quiesce() == .ready else { return Self.stuckReport() }
-        destructiveOpRunning = true
-        defer { destructiveOpRunning = false }
-        let effects = AppPaths.makeEffects()
-        let dryRun = effects is DryRunEffects
-        let resetSettings = selection.contains(.settings), clearExport = selection.contains(.exportedTranscripts)
-        if resetSettings && !dryRun { settingsWriteSuppressed = true }
-        let keep = settings
-        let layout = AppPaths.storageLayout(settings: keep)
-        if clearExport && !dryRun { readoptExports(layout) }
-        let steps = StorageOperations.clearSteps(layout, selection)
-        let plan = steps.map(\.item)
-        let rowOf = Dictionary(steps.map { ($0.item, $0.category) }, uniquingKeysWith: { first, _ in first })
-        // Each row as it starts, once, with the rows that have failed so far (hopped to the main queue in order).
-        let announce: @Sendable (ClearItem, Set<ClearItem>) -> Void = { c, failed in
-            DispatchQueue.main.async { MainActor.assumeIsolated { progress(c, failed) } }
-        }
-        // Recordings without the Journal: mark the transcripts first, re-render their notes after (no dead
-        // audio references, nothing for the runtime's reconcile to drop) — as audio retention does.
-        let recordingsOnly = selection.contains(.recordings) && !selection.contains(.journal) && !dryRun
-        var report = await Task.detached(priority: .userInitiated) {
-            var current: ClearItem?
-            var failedRows: Set<ClearItem> = []
-            var sizes: [StorageItem: Int64] = [:]
-            let willRemove: (StorageItem) -> Void = { item in
-                sizes[item] = StorageSizes.size(of: item)   // what this item frees, just before it goes
-                guard let c = rowOf[item], c != current else { return }
-                current = c; announce(c, failedRows)
-            }
-            let didRemove: (StorageItem, Bool) -> Void = { item, ok in
-                if !ok, let c = rowOf[item] { failedRows.insert(c) }
-            }
-            var r: OperationReport
-            if recordingsOnly {
-                let prep = StorageOperations.prepareRecordingsRemoval(plan, layout)
-                r = StorageOperations.execute(prep.plan, layout: layout, effects: effects, willRemove: willRemove, didRemove: didRemove)
-                r.failures = prep.failures + r.failures + StorageOperations.rerenderHistory(months: prep.months, layout)
-            } else {
-                r = StorageOperations.execute(plan, layout: layout, effects: effects, willRemove: willRemove, didRemove: didRemove)
-            }
-            r.freedBytes = r.removedItems.reduce(Int64(0)) { $0 + (sizes[$1] ?? 0) }
-            return r
-        }.value
-        let removed = report.removed   // anything left behind under a folder that couldn't go is named
-        report.failures += await Task.detached(priority: .userInitiated) {
-            StorageOperations.coveredFailures(layout, selection, removed: removed)
-        }.value
-        if clearExport && !dryRun {
-            do { try StorageOperations.forgetRemovedExports(report.removed, layout: layout, removeIfEmpty: true) }
-            catch { report.failures.append("Couldn't update the export record: \(error.localizedDescription)") }
-        }
-        if !clearExport { report.unconfirmedExport = [] }
-        defer {
-            Self.logDryRun(effects, "clear data")   // after relaunch() below too, which a dry run only notes
-            log("clear data [\(selection.map(\.rawValue).sorted().joined(separator: ","))]: removed \(report.removed.count), failures \(report.failures.count)")
-        }
-        var settingsWritten = true
-        if resetSettings {
-            let removedItems = Set(report.removedItems)
-            progress(.settings, Set(steps.filter { !removedItems.contains($0.item) }.map(\.category)))
-            effects.removeDefaults(domain: "com.sageathor.rhemion.app")
-            var fresh = AppSettings()
-            if !clearExport {
-                fresh.exportDir = keep.exportDir; fresh.exportMode = keep.exportMode
-                fresh.exportSchedule = keep.exportSchedule; fresh.exportInitialized = keep.exportInitialized
-            }
-            if !dryRun && !SettingsStore.save(fresh) {
-                settingsWritten = false
-                report.failures.append("Couldn't write fresh settings.")
-            }
-        }
-        report.clearedRows = StorageOperations.clearedRows(steps, removed: report.removedItems,
-                                                           settingsChosen: resetSettings, settingsWritten: settingsWritten)
-        guard resetSettings, !dryRun else {
-            // A dry run of a settings reset only notes the relaunch (as before), and every dry run resumes.
-            if resetSettings && report.success {
-                do { try effects.relaunch(app: Bundle.main.bundleURL, afterPID: getpid()) }
-                catch { report.failures.append("Couldn't schedule relaunch: \(error.localizedDescription)") }
-            }
-            dataOps.resume()
-            return report
-        }
-        // A real settings reset: the barrier stays up (settings are half-way to Welcome); the pop-up shows the
-        // result and its "Restart Rhemion" performs the restart (restartAfterClear()).
-        return report
-    }
-
-    /// Before an export deletion: (re)record every note in the export folder that exactly matches the
-    /// current render, so the registry names what is removed. Runs behind the barrier only.
-    private func readoptExports(_ layout: StorageLayout) {
-        guard let dir = layout.exportDir else { return }
-        do { try ExportNote.readopt(directory: dir, state: layout.stateDir, registryURL: layout.registryURL, calendar: layout.calendar) }
-        catch { log("export re-adoption failed: \(error)") }
-    }
-
-    /// A dry run (`RHEMION_UNINSTALL_DRYRUN=1`) writes every "would …" line it collected to app.log, so a
-    /// live dry run of any storage operation can be checked afterwards.
-    private static func logDryRun(_ effects: SystemEffects, _ operation: String) {
-        guard let dry = effects as? DryRunEffects else { return }
-        for line in dry.log { log("\(operation) dry run: \(line)") }
-    }
-
-    /// "Delete exported transcripts" (Settings › Journal › Export, and switching export
-    /// Off) — the same quiesce barrier, mutual exclusion and busy/stuck handling as the other operations;
-    /// removes ONLY the registry-owned files in the current export folder (never the folder), then
-    /// resumes. Files Rhemion can't confirm as its own come back in `unconfirmedExport` for the sheet.
-    /// `turnOff` (the "Turn off export?" → Delete path): export_mode becomes "off" and is persisted BEFORE
-    /// the runtime resumes, so a resumed runtime never exports into the folder that was just cleaned.
-    /// The removed names are dropped from the registry (not in a dry run, which removed nothing).
-    func runDeleteExport(turnOff: Bool) async -> OperationReport {
-        guard !dataOps.inProgress else { return Self.busyReport() }
-        guard await dataOps.quiesce() == .ready else { return Self.stuckReport() }
-        destructiveOpRunning = true
-        defer { destructiveOpRunning = false }
-        let layout = AppPaths.storageLayout(settings: settings)
-        let effects = AppPaths.makeEffects()
-        if !(effects is DryRunEffects) { readoptExports(layout) }
-        var report = StorageOperations.execute(StorageOperations.deleteExportPlan(layout), layout: layout, effects: effects)
-        if !(effects is DryRunEffects) {
-            do { try StorageOperations.forgetRemovedExports(report.removed, layout: layout) }
-            catch { report.failures.append("Couldn't update the export record: \(error.localizedDescription)") }
-        }
-        if turnOff {
-            settings.exportMode = "off"
-            if !settingsWriteSuppressed, !SettingsStore.save(settings) { log("settings: WARN save failed (export off)") }
-        }
-        Self.logDryRun(effects, "delete export")
-        log("delete export: removed \(report.removed.count), failures \(report.failures.count), unconfirmed \(report.unconfirmedExport.count)")
-        dataOps.resume()
-        return report
-    }
-
-    /// The barrier never returning `.ready` (the runtime survived SIGKILL) is reported through the same
-    /// `OperationReport` shape as an ordinary failure — `Self.quiesceStuckMessage` is the exact text the
-    /// sheet matches on to show the dedicated "Quit Rhemion" state instead of a failure list.
-    private static func stuckReport() -> OperationReport {
-        var report = OperationReport()
-        report.failures = [quiesceStuckMessage]
-        return report
-    }
-
-    /// Storage operations are mutually exclusive — a second one refused while the
-    /// barrier is up (another operation running, or a real failed settings reset/Uninstall waiting for restart).
-    static func busyReport() -> OperationReport {
-        var report = OperationReport()
-        report.failures = [busyMessage]
-        return report
-    }
-
-    /// Whether a new storage operation may start now — the sheets and the farewell window check this
-    /// before leaving their confirm step.
-    var canStartStorageOperation: Bool { !dataOps.inProgress }
 
     /// No quitting in the middle of a destructive operation
     /// A click on the Dock icon (the app is pinned there, or a window put the icon up): Rhemion is a
@@ -496,6 +250,7 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if let welcome = onboardingWindow, welcome.isShowing { welcome.bringToFront() } else { hubWindow?.show() }
+        showPendingWhatsNew()
         return true
     }
 
@@ -520,78 +275,6 @@ final class AppController: NSObject, NSApplicationDelegate {
             finishUninstall()   // exits; never returns in a real uninstall
             return .terminateCancel
         }
-    }
-
-    /// The Clear Data pop-up's "Restart Rhemion" after a settings reset (whether it succeeded or not —
-    /// the reset never quits by itself, the result is shown first). `settingsWriteSuppressed` is already
-    /// `true` and the runtime is left down in the real (non-dry-run) case — this schedules the relaunch
-    /// (into Welcome) and quits.
-    func restartAfterClear() {
-        let effects = AppPaths.makeEffects()
-        guard !(effects is DryRunEffects) else {   // a dry run never actually terminates
-            log("clear data dry run: would restart Rhemion")
-            return
-        }
-        do { try effects.relaunch(app: Bundle.main.bundleURL, afterPID: getpid()) }
-        catch { log("restart after clear data: couldn't schedule relaunch: \(error)") }
-        destructiveOpRunning = false   // runClearData has returned (already down); explicit for the exit path
-        NSApp.terminate(nil)
-    }
-
-    /// "Uninstall Rhemion" — quiesce, unregister the login item, reset the privacy
-    /// permissions, remove the chosen data (off the main actor), clear the defaults domain with app data,
-    /// then move the app to the Trash. `progress(step)` ticks the farewell window's five steps. Every
-    /// effect's failure is collected, never thrown: the window lists them honestly (a failed,
-    /// partial uninstall never resumes — the app may already be half-removed; Done quits).
-    /// `settingsWriteSuppressed` flips right after the barrier when app data is going —
-    /// settings.json is about to be deleted and must not be resurrected by an in-memory save.
-    func runUninstall(_ o: UninstallOptions, progress: @escaping @MainActor (Int) -> Void) async -> OperationReport {
-        guard !dataOps.inProgress else { return Self.busyReport() }
-        progress(0)
-        guard await dataOps.quiesce() == .ready else { return Self.stuckReport() }
-        destructiveOpRunning = true
-        defer { destructiveOpRunning = false }
-        let effects = AppPaths.makeEffects()
-        let dryRun = effects is DryRunEffects
-        if o.appData && !dryRun { settingsWriteSuppressed = true }
-        var report = OperationReport()
-        report.dryRun = dryRun
-        progress(1); do { try await effects.unregisterLoginItem() } catch { report.failures.append("Login item: \(error.localizedDescription)") }
-        progress(2); do { try await effects.resetPrivacy() } catch { report.failures.append("Permissions: \(error.localizedDescription)") }
-        progress(3)
-        let layout = AppPaths.storageLayout(settings: settings)
-        if o.export && !dryRun { readoptExports(layout) }
-        let plan = StorageOperations.uninstallPlan(layout, o)
-        // App data (incl. app.log) is about to go: from here on log() writes to stderr only, so nothing
-        // recreates the state folder after the uninstall. A dry run keeps logging to the file.
-        if o.appData && !dryRun { AppLog.fileDisabled.value = true }
-        // Off the main actor: a large recordings folder must not freeze the window (the steps and logo).
-        let data = await Task.detached(priority: .userInitiated) {
-            StorageOperations.execute(plan, layout: layout, effects: effects)
-        }.value
-        report.removed += data.removed; report.removedItems += data.removedItems
-        report.failures += data.failures; report.unconfirmedExport = data.unconfirmedExport
-        if o.appData { effects.removeDefaults(domain: "com.sageathor.rhemion.app") }
-        progress(4)
-        do { try await effects.moveAppToTrash(Bundle.main.bundleURL) }
-        catch { report.failures.append("Move Rhemion to the Trash yourself: \(error.localizedDescription)") }
-        if !dryRun { uninstallEnded = true }   // from here on a quit goes through finishUninstall()
-        Self.logDryRun(effects, "uninstall")
-        log("uninstall: removed \(report.removed.count), failures \(report.failures.count), unconfirmed export \(report.unconfirmedExport.count)")
-        return report
-    }
-
-    /// The farewell window's way out once `runUninstall` has returned: quit — except in a dry run, which
-    /// never quits and brings the runtime back instead (nothing was actually removed).
-    func finishUninstall() {
-        destructiveOpRunning = false   // already down (runUninstall has returned); explicit for the exit path
-        if AppPaths.makeEffects() is DryRunEffects { dataOps.resume(); return }
-        // Real uninstall: leave nothing behind. NSApp.terminate would run applicationWillTerminate (a
-        // log line → app.log) and let AppKit persist state into the defaults domain we just cleared, so
-        // stop the inputs and the runtime ourselves and exit directly.
-        stopInputs()
-        supervisor.stop()
-        exit(0)
     }
 
     /// Store the runtime's latest device enumeration and push it into the hub's Settings pickers (a
@@ -701,23 +384,25 @@ final class AppController: NSObject, NSApplicationDelegate {
         if welcome.isShowing { welcome.bringToFront() } else { welcome.show() }
     }
 
-    @objc private func openHub() { hubWindow?.show() }
+    @objc private func openHub() { hubWindow?.show(); showPendingWhatsNew() }
+    @objc private func openWhatsNew() { whatsNewPending = false; whatsNew?.show() }
 
     // The Dictionary and Journal now live as hub destinations; these menu items just jump the
     // hub to the right tab. The old standalone windows are gone.
     @objc private func openDictionary() { hubWindow?.show(dest: .dictionary) }
 
     @objc private func openJournal() { hubWindow?.show(dest: .journal) }
+    @objc private func togglePin() { pin.toggle() }
 
     @objc private func openWelcome() { onboardingWindow?.show() }
-    @objc private func openAbout() { aboutWindow.show() }
+    @objc func openAbout() { aboutWindow.show() }
 
     // Global hotkeys are suspended while ANY settings recorder captures a chord; a depth counter keeps
     // them suspended until the last active recorder finishes (two rows can record at once).
     private var recordingDepth = 0
     private func beginHotkeyRecording() {
         if recordingDepth == 0 {
-            recall?.suspend(); dictAdd?.suspend(); undoReplace?.suspend()
+            recall?.suspend(); dictAdd?.suspend(); undoReplace?.suspend(); pin.suspend()
             escGesture?.suspend()   // let the recorder's monitor see Esc; don't act on it as a gesture
         }
         recordingDepth += 1
@@ -726,141 +411,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         recordingDepth = max(0, recordingDepth - 1)
         if recordingDepth == 0 {
             recall?.setHotkeys(settings.recallHotkeys)
+            pin.setHotkeys(settings.pinHotkeys)
             dictAdd?.setHotkeys(settings.dictAddHotkeys)
             undoReplace?.setHotkeys(settings.undoHotkeys)
             escGesture?.resume()
         }
     }
 
-    /// The double-Esc gesture: cancel the recording in progress, or (nothing recording) erase the
-    /// just-delivered take at the frontmost app. Same stroke, stage-dependent meaning. Returns whether
-    /// it CLAIMED an action, so the Esc tap swallows the second Esc only when it did.
-    @MainActor
-    private func handleEscapeGesture() -> Bool {
-        if recordingFlag.value {
-            log("double-Esc: cancel recording")
-            recordingFlag.value = false
-            hotkey?.abortRecording()   // so the eventual PTT release doesn't send a stray .stop
-            client?.send(.cancel)      // runtime discards the take: no transcript, no history, no recall
-            indicator?.hide()
-            return true
-        }
-        return deleteLastTake()
-    }
-
-    /// Erase the most recently delivered take with Backspace×n, but only if it is still armed AND
-    /// landed in the app that is frontmost now (the same TTL + pid-match heuristic as undo-replace, so
-    /// we never delete into a different app; the caret-moved-since-delivery edge is the same accepted
-    /// limitation both gestures share). Returns whether a take was claimed. Success is silent — the
-    /// vanished text is the confirmation.
-    @MainActor
-    private func deleteLastTake() -> Bool {
-        guard let front = NSWorkspace.shared.frontmostApplication?.processIdentifier,
-              let n = undoStore.takeDelete(matchingPid: Int(front)) else {
-            log("double-Esc: nothing to erase here"); return false
-        }
-        let pid = Int(front)
-        let indicator = self.indicator
-        DispatchQueue.global(qos: .userInitiated).async {
-            if KeyboardEdit.deleteBackward(n: n, pid: pid) {
-                log("double-Esc: erased last take (\(n))")
-            } else {
-                log("double-Esc: erase aborted (modifiers held)")
-                Task { @MainActor in indicator?.error() }
-            }
-        }
-        return true
-    }
-
-    /// Deliver a recalled transcript into the current focus through the normal delivery path, so it
-    /// gets the SAME boundary spacing and AX/paste routing as a fresh dictation (recall used to paste
-    /// raw, with no leading/trailing space). targetPid nil = universal (wherever focus is now);
-    /// success is silent, a failure flashes the indicator.
-    @MainActor
-    private func deliverRecall(_ text: String) {
-        guard let delivery else { return }
-        let indicator = self.indicator
-        delivery.onDeliver(
-            text: text, original: nil, session: "recall-\(UUID().uuidString)", targetPid: nil,
-            inputMethod: inputMethod.value,
-            sendAck: { _, _ in },
-            onResult: { status in
-                log("recall delivery: \(status)")
-                if !isDeliverySuccess(status) { Task { @MainActor in indicator?.error() } }
-            }
-        )
-    }
-
     // MARK: - NSApplicationDelegate lifecycle
-
-    /// ⌘Q: close every Rhemion window the normal way (performClose — a window mid-operation refuses, as it should);
-    /// Rhemion itself keeps running in the menu bar.
-    @objc private func closeAllWindows() {
-        for window in NSApp.windows where window.isVisible && window.styleMask.contains(.titled) {
-            window.performClose(nil)
-        }
-    }
-
-    /// The app's main menu. Rhemion is a menu-bar app, but its windows (Journal, Settings, Clear Data, Uninstall,
-    /// Welcome) put up a Dock icon and the menu bar — without a main menu, ⌘Q / ⌘W / ⌘C / ⌘V do nothing there.
-    /// Quit goes through NSApp.terminate, so applicationShouldTerminate still refuses mid-operation.
-    private func installMainMenu() {
-        let main = NSMenu()
-        let appItem = NSMenuItem(); main.addItem(appItem)
-        let app = NSMenu(title: "Rhemion")
-        let about = NSMenuItem(title: "About Rhemion", action: #selector(openAbout), keyEquivalent: ""); about.target = self
-        app.addItem(about)
-        app.addItem(.separator())
-        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","); settings.target = self
-        app.addItem(settings)
-        app.addItem(.separator())
-        app.addItem(NSMenuItem(title: "Hide Rhemion", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
-        app.addItem(.separator())
-        // ⌘Q only closes Rhemion's windows — Rhemion lives in the menu bar, and an accidental ⌘Q must not silently
-        // stop dictation. Quitting for real is ⌥⌘Q here, or "Quit Rhemion" in the menu-bar menu (owner decision).
-        let closeAll = NSMenuItem(title: "Close Rhemion Windows", action: #selector(closeAllWindows), keyEquivalent: "q")
-        closeAll.target = self
-        app.addItem(closeAll)
-        let quit = NSMenuItem(title: "Quit Rhemion", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        quit.keyEquivalentModifierMask = [.command, .option]
-        app.addItem(quit)
-        appItem.submenu = app
-        app.delegate = self   // re-strips icons right before it opens (macOS 26 decorates "About" late)
-        let editItem = NSMenuItem(); main.addItem(editItem)
-        let edit = NSMenu(title: "Edit")
-        edit.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
-        let redo = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "z"); redo.keyEquivalentModifierMask = [.command, .shift]
-        edit.addItem(redo)
-        edit.addItem(.separator())
-        edit.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
-        edit.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
-        edit.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
-        edit.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
-        editItem.submenu = edit
-        let windowItem = NSMenuItem(); main.addItem(windowItem)
-        let window = NSMenu(title: "Window")
-        window.addItem(NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
-        window.addItem(NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
-        windowItem.submenu = window
-        Self.withoutItemIcons(main)
-        NSApp.mainMenu = main
-        NSApp.windowsMenu = window
-        Self.withoutItemIcons(main)   // again: setting the main menu can re-decorate the app menu
-    }
-
-    /// Menus without item icons (owner decision, 05.10.2026): short menus scan faster without them, and the app
-    /// looks the same on macOS 15, 26 and 27. macOS 26 adds its own icons to recognised commands (Settings,
-    /// Quit, Close…); assigning an image and then nil opts an item out (AppKit engineer, Apple Developer
-    /// Forums thread 800414). Recurses into submenus.
-    static func withoutItemIcons(_ menu: NSMenu) {
-        for item in menu.items {
-            if !item.isSeparatorItem {
-                item.image = NSImage(size: NSSize(width: 1, height: 1))
-                item.image = nil
-            }
-            if let submenu = item.submenu { withoutItemIcons(submenu) }
-        }
-    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMainMenu()
@@ -893,10 +451,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         let delivery = Delivery()
         // Arm/disarm the in-place undo from the delivery outcome (disarm at every delivery start, arm on
         // a landed dictionary substitution).
-        delivery.onArmUndo = { [undoStore] deliveredN, pid, undoRaw in
-            undoStore.arm(deliveredN: deliveredN, pid: pid, undoRaw: undoRaw)
+        delivery.onArmUndo = { [undoStore] deliveredN, pid, undoRaw, session in
+            undoStore.arm(deliveredN: deliveredN, pid: pid, undoRaw: undoRaw, session: session)
         }
         delivery.onDisarmUndo = { [undoStore] in undoStore.disarm() }
+        ClipboardPaste.trackKeyboardLayout()   // V for ⌘V by the shortcut layout, kept current on layout changes
+        startBench(indicator: indicator)   // developer-only insertion bench (AppController+Bench.swift)
         let client = RuntimeClient(socketPath: supervisor.socketPath)
         client.onConnect = { [weak client, weak self] in
             log("runtime connected")
@@ -928,16 +488,62 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         modelDownload.onCancel = { [weak client] in client?.send(.cancelModelDownload) }
         let perf = DictationPerf()   // per-dictation latency by phase → `perf:` lines in app.log
+        delivery.onVisible = { session, at in
+            guard !session.hasPrefix("again-"), !session.hasPrefix("recall-"), !session.hasPrefix("bench-") else { return }
+            perf.markVisible(at: at)
+        }
+        let targets = TargetStore()  // press-time target snapshots, matched at delivery: a lost target keeps the text
+        let recents = recentTargets
+        let again = againTargets
+        // Insert again: only the restored field itself; never "unknown", never another field of the app.
+        let againAllows: @Sendable (String, String) -> Bool? = { session, when in
+            guard let snap = again.value[session] else { return nil }
+            let (match, _) = snap.matchNow()
+            let ok = match == .sameElement || match == .sameField
+            log("insert again: target \(match.rawValue) \(when), \(ok ? "insert" : "kept")")
+            return ok
+        }
+        delivery.targetRecheck = { session in
+            if let ok = againAllows(session, "just before ⌘V") { return ok }
+            guard let snap = recents.value[session]?.snap else { return true }
+            let (match, _) = snap.matchNow()
+            if !snap.allows(match) { log("target: \(match.rawValue) just before ⌘V, kept") }
+            return snap.allows(match)
+        }
+        delivery.targetCheck = { session in
+            if let ok = againAllows(session, "at delivery") { return ok }
+            guard let snap = targets.take(session: session) else { return true }   // Recall, bench, no snapshot
+            recents.value = { var m = recents.value; m[session] = (Date(), snap)
+                if m.count > 100, let oldest = m.min(by: { $0.value.at < $1.value.at })?.key { m[oldest] = nil }
+                return m }()
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            let (match, detail) = snap.matchNow()
+            let allowed = snap.allows(match)
+            log("target: \(match.rawValue) (\(detail))\(match == .otherField && !snap.editable ? " picked-while-speaking" : "") \(allowed ? "insert" : "kept") \((DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000) ms")
+            return allowed
+        }
+        let journalPress = self.journalPress
         client.onEvent = { [weak client, weak self, inputMethod] event in
             // Per-tick microphone levels aren't logged (dozens a second while dictating); state changes are.
             if case .level = event {} else { log("event: \(eventLabel(event))") }
             switch event {
-            case .started:        perf.markStarted(); Task { @MainActor in indicator.recording() }
+            case .started(let s):
+                perf.markStarted(); targets.started(session: s)
+                let journal = journalPress.value; journalPress.value = false
+                Task { @MainActor in indicator.recording(journalOnly: journal) }
             case .level(let rms): Task { @MainActor in indicator.onLevel(rms); self?.hotkey?.onLevel(rms) }
             case .stopped:        perf.markStopped(); Task { @MainActor in indicator.processing() }
             case let .transcript(_, ms, _): perf.markTranscript(engineMS: ms)
-            case .canceled:       perf.cancel(); Task { @MainActor in indicator.hide() }
-            case .error:          Task { @MainActor in indicator.error() }
+            case .canceled(let s):
+                perf.cancel(); Task { @MainActor in indicator.hide() }
+                // A kept cancel is journaled by the runtime: keep its press-time target for Insert again.
+                if let snap = targets.take(session: s) {
+                    recents.value = { var m = recents.value; m[s] = (Date(), snap); return m }()
+                }
+            case .error:          perf.cancel(); Task { @MainActor in indicator.failed() }   // no text came back
+            case .journaled:      perf.cancel(); Task { @MainActor in indicator.journaled() }   // saved to the journal only
+            case let .rerecognized(id, ok, error):
+                Task { @MainActor in self?.hubWindow?.journal.recognized(id: id, ok: ok, error: error) }
             case let .devices(models, mics): Task { @MainActor in self?.updateDevices(models: models, mics: mics) }
             case let .modelDownload(_, state, fraction, error):
                 Task { @MainActor in
@@ -987,16 +593,23 @@ final class AppController: NSObject, NSApplicationDelegate {
                         log("deliver dropped: data operation in progress")
                         return
                     }
+                    let ack: (String, String) -> Void = { s, status in client?.send(.deliverResult(session: s, status: status)) }
+                    let finished: (String) -> Void = { status in
+                        log("delivery: \(status)")
+                        perf.markInserted(method: "\(status)")
+                        let ok = isDeliverySuccess(status)
+                        // Not inserted, but the text is in the Journal: "kept" (amber), never the red "failed".
+                        Task { @MainActor in
+                            if ok { indicator.done(); self?.pin.refresh() } else { indicator.kept() }
+                        }
+                    }
+                    if targets.isPinReturn(session: session), let self {
+                        self.deliverToPinned(text: text, original: original, session: session, ack: ack, finished: finished)
+                        return
+                    }
                     delivery.onDeliver(
                         text: text, original: original, session: session, targetPid: targetPid,
-                        inputMethod: inputMethod.value,
-                        sendAck: { s, status in client?.send(.deliverResult(session: s, status: status)) },
-                        onResult: { status in
-                            log("delivery: \(status)")
-                            perf.markInserted(method: "\(status)")
-                            let ok = isDeliverySuccess(status)
-                            Task { @MainActor in if ok { indicator.done() } else { indicator.error() } }
-                        }
+                        inputMethod: inputMethod.value, sendAck: ack, onResult: finished
                     )
                 }
             default: break
@@ -1008,7 +621,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         //    start/stop over the socket, carrying the frontmost pid so the runtime binds delivery to
         //    the app that was focused at press.
         let hotkey = HotkeyTap()
-        hotkey.onStart = { [weak client, weak self, recordingFlag, modelReady, micAuthorizedAtRuntimeStart] pid in
+        hotkey.onStart = { [weak client, weak self, recordingFlag, modelReady, micAuthorizedAtRuntimeStart, journalPress] pid, journalOnly in
             // Hot-path gate: don't start a take until the speech model is ready and the microphone may be used
             // — otherwise the runtime has nothing to record or nothing to recognise with. Read thread-safe
             // state (onStart can run off the main actor); show a cue and the Welcome window instead.
@@ -1031,10 +644,27 @@ final class AppController: NSObject, NSApplicationDelegate {
                 MainActor.assumeIsolated { self?.hotkey?.abortRecording() }
                 return
             }
-            log("PTT down -> start (pid \(pid))")
+            log("PTT down -> start (pid \(pid))\(journalOnly ? " journal only" : "")")
             perf.markPress()
             recordingFlag.value = true
-            client?.send(.start(pressedAt: nil, targetPid: Int(pid)))
+            // Journal only (Shift with the key, 3.1): nothing is inserted, so no target and no pinned window.
+            if journalOnly {
+                journalPress.value = true
+                client?.send(.startJournal(pressedAt: nil, targetPid: Int(pid)))
+                return
+            }
+            // A pinned window takes the text (3.1). "stay": go there now; "return": keep working, the text is put
+            // there later by a jump. Otherwise: where this take started (app, window, field).
+            let pinTarget = MainActor.assumeIsolated { self?.pin.target }
+            let pinStay = MainActor.assumeIsolated { self?.settings.pinMode != "return" }
+            if let pinTarget {
+                targets.pressed(snapshot: pinTarget, pinReturn: !pinStay)
+                client?.send(.start(pressedAt: nil, targetPid: pinTarget.pid))
+                if pinStay { DispatchQueue.main.async { MainActor.assumeIsolated { _ = self?.pin.bringForward() } } }
+            } else {
+                targets.pressed(pid: Int(pid))
+                client?.send(.start(pressedAt: nil, targetPid: Int(pid)))
+            }
         }
         hotkey.onStop = { [weak client, weak self, recordingFlag] in
             guard recordingFlag.value else { return }   // a gated press never started — send no stray .stop
@@ -1063,6 +693,15 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         recall.setHotkeys(settings.recallHotkeys)
 
+        // 3b') Pin to this window (default ⌥⌘P): toggles the pin; the notch shows the resting orb, a click on it unpins.
+        pin.setHotkeys(settings.pinHotkeys)
+        pin.autoUnpinMinutes = settings.pinAutoUnpin ? settings.pinAutoUnpinMinutes : 0
+        pin.onChange = { [weak self] on in
+            self?.indicator?.setPinned(on)
+            self?.pinMenuItem?.title = on ? "Unpin window" : "Pin to this window"
+        }
+        indicator.onPinnedOrbClick = { [weak self] in self?.pin.unpin(reason: "orb clicked") }
+
         // 3c) Dict-add hotkey (global Carbon chord, default Cmd+Option+W): reads the current selection
         //     then opens the "as heard → correct" panel, which writes the replacement into the
         //     dictionary the runtime hot-reloads.
@@ -1087,7 +726,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         //     an engaged double-tap is swallowed): cancels a recording in progress, or erases the
         //     just-delivered take. Engages only while a take is recording or an armed take is fresh.
         let escGesture = EscapeGesture()
-        escGesture.isEligible = { [recordingFlag, undoStore] in recordingFlag.value || undoStore.isArmed() }
+        let escPolicy = self.escPolicy
+        escGesture.isEligible = { [recordingFlag, undoStore] in
+            let p = escPolicy.value
+            if let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier, p.except.contains(front) { return false }
+            return (p.cancel && recordingFlag.value) || (p.erase && undoStore.isArmed())
+        }
         // Synchronous on the tap's main-run-loop callback (assumeIsolated is safe — we ARE on main), so
         // the swallow decision reflects whether the gesture actually claimed an action THIS press.
         escGesture.onDoubleTap = { [weak self] in
@@ -1095,6 +739,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         escGesture.setWindowMS(settings.escDoubleTapMS)
         escGesture.start()
+        applyShortcutSettings(settings)
 
         // 4) Hub window (it owns Settings, reached via "Open Rhemion…" or ⌘,). Apply-on-
         //    change: persist the snapshot, then re-apply live — rebind the PTT modifier and swap the
@@ -1114,6 +759,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                     log("settings: WARN save failed — live change applied but not persisted")
                 }
                 self.inputMethod.value = updated.inputMethod
+                self.hubWindow?.journal.keepCanceledHours = updated.keepCanceledHours
                 self.hotkey?.setPTTKeys(updated.pttKeys)
                 self.hotkey?.setHandsFreeTimings(ringAfter: Double(updated.handsfreeCountdownAfterSecs),
                                                  countdown: Double(updated.handsfreeCountdownSecs))
@@ -1122,11 +768,14 @@ final class AppController: NSObject, NSApplicationDelegate {
                 // self.settings when the last active recorder ends.
                 if self.recordingDepth == 0 {
                     self.recall?.setHotkeys(updated.recallHotkeys)
+                    self.pin.setHotkeys(updated.pinHotkeys)
                     self.dictAdd?.setHotkeys(updated.dictAddHotkeys)
                     self.undoReplace?.setHotkeys(updated.undoHotkeys)
                 }
                 self.undoStore.setTTL(Double(updated.undoTTLSecs))
+                self.pin.autoUnpinMinutes = updated.pinAutoUnpin ? updated.pinAutoUnpinMinutes : 0
                 self.escGesture?.setWindowMS(updated.escDoubleTapMS)
+                self.applyShortcutSettings(updated)
                 LoginItem.reconcile(enabled: updated.launchAtLogin)
                 if modelDirsChanged { self.client?.send(.listDevices) }
                 log("settings changed: ptt=[\(updated.pttKeys.joined(separator: ","))], input=\(updated.inputMethod), language=\(updated.language)")
@@ -1142,6 +791,17 @@ final class AppController: NSObject, NSApplicationDelegate {
             isRecording: { [weak self] in self?.dataOps.isRecording ?? false },
             storageActivity: dataOps
         )
+        // 4a) The Journal's Insert again (3.1): put a not-inserted text back where it was meant to go.
+        hubWindow?.journal.keepCanceledHours = settings.keepCanceledHours
+        // Canceled entries are kept only for Settings › Journal's "Keep them for": purge the expired ones now and hourly.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in self?.purgeExpiredCanceled() }   // once the runtime is up
+        canceledPurgeTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.purgeExpiredCanceled() }
+        }
+        let knownTargets = recentTargets
+        hubWindow?.journal.canInsertAgain = { entry in entry.session.map { knownTargets.value[$0] != nil } ?? false }
+        hubWindow?.journal.insertAgain = { [weak self] entry, done in self?.insertAgain(entry, done) }
+        hubWindow?.journal.recognizeAgain = { [weak self] entry in self?.client?.send(.rerecognize(id: entry.id)) }
 
         // 4b) Uninstall: the farewell window, opened from Settings › Advanced › Storage.
         farewellWindow = FarewellWindowController(
@@ -1178,6 +838,8 @@ final class AppController: NSObject, NSApplicationDelegate {
             modelDownload: modelDownload,
             onMicrophoneGranted: { [weak self] in self?.restartRuntimeForMicrophone() }
         )
+        // Before Welcome marks itself shown: a fresh install has never seen it (then What's New stays quiet).
+        let freshInstall = !OnboardingWindowController.hasBeenShown
         let launch = Self.launchKind()
         log("launch: \(launch.label)")
         if onboardingWindow?.needsShowing == true {
@@ -1189,6 +851,23 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         watchForMicrophoneGrant()
 
+        // 5b) What's New: once per version, after an update only; Welcome first when it is needed.
+        let version = AboutInfo(bundle: .main).version
+        let whatsNew = WhatsNewWindowController(version: version)
+        self.whatsNew = whatsNew
+        aboutWindow.onWhatsNew = { [weak whatsNew] in whatsNew?.show() }
+        if WhatsNewPolicy.shouldShow(current: version, freshInstall: freshInstall), whatsNew.hasNotes,
+           onboardingWindow?.isShowing != true {
+            if launch == .byUser {
+                let recording = recordingFlag
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    if recording.value { self?.whatsNewPending = true } else { whatsNew.show() }   // never over a dictation
+                }
+            } else {
+                whatsNewPending = true   // a login start: shown when Rhemion is first opened
+            }
+        }
+
         // Testing hook: RHEMION_OPEN_HUB=1 pops the hub on launch so it can be shown without clicking the
         // menu-bar item (no permanent behaviour change — the menu item is the real entry point).
         if let openHub = ProcessInfo.processInfo.environment["RHEMION_OPEN_HUB"], !openHub.isEmpty {
@@ -1199,6 +878,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         self.delivery = delivery
         self.client = client
         self.hotkey = hotkey
+        applyShortcutSettings(settings)   // now that the hotkey is stored, its gesture switches apply too
         self.recall = recall
         self.dictAdd = dictAdd
         self.dictAddPanel = dictAddPanel
@@ -1207,7 +887,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     /// Stop every global hotkey/event tap (quit and the uninstall exit path).
-    private func stopInputs() {
+    func stopInputs() {
         hotkey?.stop()
         recall?.stop()
         dictAdd?.stop()
@@ -1248,8 +928,3 @@ app.setActivationPolicy(.accessory)   // menu-bar only; no Dock icon (also decla
 let controller = AppController()
 app.delegate = controller             // drives applicationDidFinishLaunching / WillTerminate
 app.run()
-
-// The app menu strips its icons again each time it is about to open (see withoutItemIcons).
-extension AppController: NSMenuDelegate {
-    func menuNeedsUpdate(_ menu: NSMenu) { Self.withoutItemIcons(menu) }
-}

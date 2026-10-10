@@ -1,6 +1,11 @@
 // NotchIndicator — the renderer (IndicatorView) draws
-// the plate + breathing orb + halo + spinner dots + result glyph, with fixed geometry/colors/animation
-// constants. NotchIndicator owns the window + style:
+// the plate + breathing orb + halo + the waiting motion and the outcome, with fixed geometry/colors/animation
+// constants. The orb is the user's voice inside the Mac, so its waves only ever go OUT (the logo's law: the
+// closer to the orb, the louder the ring, loudness = r1/r). Waiting (3.1): "the logo breathes
+// out", the mark's rings stand round the orb and a pressure pulse passes out through them. Outcomes grow from
+// that breath: inserted = the last ring goes out past the edge; kept (not inserted, nothing lost) = the nearest
+// ring closes round the orb; failed (no text) = "the source goes out", a red pulse leaves and the orb empties.
+// Rings moving IN towards the orb are reserved for Claude's future spoken replies. NotchIndicator owns the window + style:
 //   .notch    — plate the exact size of the notch (black-on-black, invisible) that slides RIGHT by
 //               `ext` px, the orb riding in that right ear. Default on notched Macs.
 //   .floating — a rounded pill just below the menu bar (displays without a notch / explicit choice).
@@ -20,7 +25,8 @@ private let ACCENT_HI: (CGFloat, CGFloat, CGFloat) = (0.953, 0.784, 0.408)
 private let ACCENT_LO: (CGFloat, CGFloat, CGFloat) = (0.878, 0.643, 0.180)
 // Pale cream sheen for the orb's matte highlight (same diffuse-light idea as the app icon).
 private let SHEEN: (CGFloat, CGFloat, CGFloat) = (1.0, 0.94, 0.78)
-private let REDC: (CGFloat, CGFloat, CGFloat) = (0.92, 0.36, 0.36)
+// DESIGN.md's one danger red (system red, dark variant: the plate is black).
+private let REDC: (CGFloat, CGFloat, CGFloat) = (1.0, 0.271, 0.227)
 private let M_BASE: CGFloat = 2.5, M_GROW: CGFloat = 6.0
 private let RENDER_INTERVAL = 0.06, ANIM_INTERVAL = 0.02, SPIN_INTERVAL = 0.03
 private let DOTS_N = 9, DOT_FADE: CGFloat = 270
@@ -52,12 +58,53 @@ final class NotchIndicator {
         dropWindow()
     }
 
-    func recording() { show(); view?.recording() }
+    /// `journalOnly` (Shift with the dictation key, 3.1): a thin still ring stands round the orb while you speak
+    /// and while it is recognised, so you know the take goes to the Journal only.
+    func recording(journalOnly: Bool = false) { show(); view?.recording(journalOnly: journalOnly) }
     func onLevel(_ rms: Double) { view?.onLevel(rms) }
-    func processing() { view?.hold() }   // release freezes the orb; the spinner blooms after a grace
-    func done() { view?.done() }
-    func error() { show(); view?.error() }
+    func processing() { view?.hold() }   // release freezes the orb; the waiting motion starts after a grace
+    /// Inserted: the last ring goes out past the edge, the orb fades.
+    func done() { view?.finish(.inserted) }
+    /// Not inserted, nothing lost (the text is in the Journal): the nearest ring closes round the orb.
+    func kept() { show(); view?.finish(.kept) }
+    /// Saved to the Journal only, on purpose: the mark comes to rest (the four rings settle into the logo for a
+    /// moment) and fades as one. Nothing travels out: nothing was sent anywhere.
+    func journaled() { show(); view?.finish(.journaled) }
+    /// No text was kept (recognition failed) or a command failed: the source goes out, in the danger red.
+    func failed() { show(); view?.finish(.failed) }
+    func error() { failed() }
     func hide() { view?.hide() }
+
+    /// A window is pinned (3.1): the orb stays at the notch, small and quiet, sending one ring out every 3.5 s,
+    /// and a click on it unpins. While pinned, every other state returns to this rest instead of retracting.
+    func setPinned(_ on: Bool) {
+        if on { show() }
+        view?.setPinned(on)
+        if on { startPointerWatch() } else { stopPointerWatch() }
+    }
+    /// The resting orb was clicked.
+    var onPinnedOrbClick: (() -> Void)?
+
+    // The window is click-through except over the resting orb, and only while pinned: a pointer watch turns
+    // mouse events on when the pointer is over the orb (≈20 pt) and off again when it leaves.
+    private var pointerMonitors: [Any] = []
+    private func startPointerWatch() {
+        guard pointerMonitors.isEmpty else { return }
+        let handler: (NSEvent) -> Void = { [weak self] _ in MainActor.assumeIsolated { self?.updatePointer() } }
+        if let g = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved], handler: handler) { pointerMonitors.append(g) }
+        if let l = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved], handler: { e in handler(e); return e }) { pointerMonitors.append(l) }
+    }
+    private func stopPointerWatch() {
+        pointerMonitors.forEach { NSEvent.removeMonitor($0) }; pointerMonitors.removeAll()
+        window?.ignoresMouseEvents = true
+        view?.setHover(false)
+    }
+    private func updatePointer() {
+        guard let window, let view, let c = view.orbScreenPoint() else { return }
+        let p = NSEvent.mouseLocation, over = hypot(p.x - c.x, p.y - c.y) <= 11 && view.canClickOrb
+        window.ignoresMouseEvents = !over
+        view.setHover(over)
+    }
     /// Hands-free silence countdown: `remaining` shrinks 1→0; the ring depletes. Speech → cancelCountdown().
     func countdown(_ remaining: Double) { show(); view?.countdown(CGFloat(remaining)) }
     func cancelCountdown() { view?.cancelCountdown() }
@@ -152,7 +199,8 @@ final class NotchIndicator {
         let v = IndicatorView(frame: NSRect(origin: .zero, size: frame.size),
                               style: l.style, plateH: l.plateH, retractedW: l.retractedW, expandedW: l.expandedW)
 
-        let panel = IndicatorWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        let panel = IndicatorWindow(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isFloatingPanel = true; panel.becomesKeyOnlyIfNeeded = true; panel.hidesOnDeactivate = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.level = .statusBar
@@ -160,6 +208,7 @@ final class NotchIndicator {
         panel.hasShadow = false
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         v.onRetracted = { [weak self] in self?.window?.orderOut(nil) }
+        v.onOrbClick = { [weak self] in self?.onPinnedOrbClick?() }
         panel.contentView = v
         window = panel
         view = v
@@ -189,7 +238,8 @@ final class NotchIndicator {
 
 /// The indicator's borderless window. It sits in the menu-bar band, which AppKit treats as off-limits
 /// for ordinary windows and pushes them out of on a display change; the frame we set is the frame we mean.
-private final class IndicatorWindow: NSWindow {
+/// A non-activating panel, so a click on the pinned orb never brings Rhemion forward or takes the focus.
+private final class IndicatorWindow: NSPanel {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
@@ -197,7 +247,7 @@ private final class IndicatorWindow: NSWindow {
 
 @MainActor
 private final class IndicatorView: NSView {
-    enum Phase { case hidden, recording, holding, processing, finishing, countdown, download, hint, preparing }
+    enum Phase { case hidden, recording, holding, processing, finishing, countdown, download, hint, preparing, pinned, unpinning }
 
     private let style: NotchIndicator.Style
     private let plateH: CGFloat
@@ -213,6 +263,98 @@ private final class IndicatorView: NSView {
     private var ringFrac: CGFloat = 0
 
     private var meterTimer: Timer?, animTimer: Timer?, spinTimer: Timer?, graceTimer: Timer?, procTimer: Timer?
+    private var echoTimer: Timer?   // the pinned rest's echo bursts (separate from slide()'s animTimer)
+    enum Outcome { case inserted, kept, failed, journaled }
+    private var waitStart: CFTimeInterval = 0
+    private var outcome: (kind: Outcome, start: CFTimeInterval, from: Breath)?
+    private var retractFrom: CGFloat?
+    private let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    private var pinned = false, hover = false
+    /// The take in progress is Journal only: the still ring shows from the press to the ending.
+    private var journalCue = false, journalCueStart: CFTimeInterval = 0
+    private var pinStart: CFTimeInterval = 0, unpinStart: CFTimeInterval = 0
+    var onOrbClick: (() -> Void)?
+    var canClickOrb: Bool { phase == .pinned }
+
+    func orbScreenPoint() -> NSPoint? {
+        guard let window else { return nil }
+        let local = NSPoint(x: orbCx, y: orbCy)
+        let inWindow = convert(local, to: nil)
+        return window.convertPoint(toScreen: inWindow)
+    }
+    override func mouseDown(with event: NSEvent) { if phase == .pinned { onOrbClick?() } }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    func setHover(_ on: Bool) { guard hover != on else { return }; hover = on; needsDisplay = true }   // redraws itself
+
+    func setPinned(_ on: Bool) {
+        guard pinned != on else { return }
+        pinned = on
+        if on {
+            if phase == .hidden { enterPinnedRest(fresh: true) }
+        } else if phase == .pinned {
+            stopAll(); phase = .unpinning; unpinStart = CACurrentMediaTime(); retractFrom = nil
+            let t = Timer(timeInterval: ANIM_INTERVAL, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    let u = CACurrentMediaTime() - self.unpinStart
+                    if u > 1.3 {
+                        let p = min(1, (u - 1.3) / 0.36), e = p * p * (3 - 2 * p)
+                        if self.retractFrom == nil { self.retractFrom = self.plateW }
+                        if self.style == .notch, let f = self.retractFrom { self.plateW = f + (self.retractedW - f) * CGFloat(e) }
+                        if p >= 1 { self.procTimer?.invalidate(); self.procTimer = nil; self.phase = .hidden; self.onRetracted?(); return }
+                    }
+                    self.needsDisplay = true
+                }
+            }
+            RunLoop.main.add(t, forMode: .common); procTimer = t
+        }
+    }
+
+    /// The pinned rest: plate out, the small quiet orb, one echo every 3.5 s (drawn ~30 fps only while it travels).
+    private func enterPinnedRest(fresh: Bool, quietFor: Double = 0) {
+        stopAll()
+        phase = .pinned
+        // A fresh pin opens with its stronger echo; after an outcome the next echo waits `quietFor` seconds.
+        pinStart = CACurrentMediaTime() - (fresh ? 0 : 1.2 + (quietFor > 0 ? 3.5 - quietFor : 0))
+        if style == .notch, plateW < expandedW { slide(to: expandedW) }
+        needsDisplay = true
+        guard !reduceMotion else { return }   // the still orb: hover redraws on its own, nothing else moves
+        // Wake only while an echo travels (~1.25 s at 30 fps), then sleep until the next one.
+        func burst() {
+            echoTimer?.invalidate()
+            let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    guard self.phase == .pinned else { self.echoTimer?.invalidate(); self.echoTimer = nil; return }
+                    let u = CACurrentMediaTime() - self.pinStart
+                    let c = u < 1.2 ? u : (u - 1.2).truncatingRemainder(dividingBy: 3.5)
+                    self.needsDisplay = true
+                    if c >= 1.25 { self.echoTimer?.invalidate(); self.echoTimer = nil }
+                }
+            }
+            RunLoop.main.add(t, forMode: .common); echoTimer = t
+        }
+        let u0 = CACurrentMediaTime() - pinStart
+        let c0 = u0 < 1.2 ? u0 : (u0 - 1.2).truncatingRemainder(dividingBy: 3.5)
+        if c0 < 1.25 { burst() }
+        let firstWait = u0 < 1.2 ? (1.2 - u0) : (3.5 - c0)
+        let starter = Timer(timeInterval: max(0.05, firstWait), repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.phase == .pinned else { return }
+                burst()
+                let every = Timer(timeInterval: 3.5, repeats: true) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        guard self.phase == .pinned else { self.procTimer?.invalidate(); self.procTimer = nil; return }
+                        burst()
+                    }
+                }
+                RunLoop.main.add(every, forMode: .common); self.procTimer = every
+            }
+        }
+        RunLoop.main.add(starter, forMode: .common); procTimer = starter
+    }
     var onRetracted: (() -> Void)?
 
     // Flipped so top-left / y-down math applies directly.
@@ -244,12 +386,14 @@ private final class IndicatorView: NSView {
 
     // MARK: state machine
 
-    func recording() {
+    func recording(journalOnly: Bool = false) {
+        journalCue = journalOnly; journalCueStart = CACurrentMediaTime()
+        let wasOut = phase != .hidden && plateW >= expandedW - 0.5   // pinned rest, an outcome still showing
         stopAll()
         phase = .recording
-        plateW = retractedW
         glyph = nil; dotsAlpha = 0
-        if style == .notch { slide(to: expandedW) }
+        // Already out (a pinned window keeps the plate out): stay put, only the orb changes. Never slide in and out.
+        if !wasOut { plateW = retractedW; if style == .notch { slide(to: expandedW) } } else { plateW = expandedW }
         startMeter()
         needsDisplay = true
     }
@@ -333,8 +477,14 @@ private final class IndicatorView: NSView {
     func processing() {
         stopGrace()
         phase = .processing
-        startSpinner()
-        procTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: false) { [weak self] _ in   // safety: never freeze
+        waitStart = CACurrentMediaTime()
+        animTimer?.invalidate()
+        animTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 40, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.needsDisplay = true }
+        }
+        // Waiting lasts until the real result (long dictations take seconds to recognise); the watchdog only
+        // guards against a lost result, far beyond any recognition time.
+        procTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.phase == .processing else { return }
                 self.hide()
@@ -342,18 +492,17 @@ private final class IndicatorView: NSView {
         }
     }
 
-    func done() { finish(kind: "ok") }
-    func error() { phase = .finishing; finish(kind: "error") }
-
     func hide() {
+        journalCue = false
+        if pinned { enterPinnedRest(fresh: false); return }
         stopAll()
         phase = .hidden
         onRetracted?()
     }
 
     func stopAll() {
-        [meterTimer, animTimer, spinTimer, graceTimer, procTimer].forEach { $0?.invalidate() }
-        meterTimer = nil; animTimer = nil; spinTimer = nil; graceTimer = nil; procTimer = nil
+        [meterTimer, animTimer, spinTimer, graceTimer, procTimer, echoTimer].forEach { $0?.invalidate() }
+        meterTimer = nil; animTimer = nil; spinTimer = nil; graceTimer = nil; procTimer = nil; echoTimer = nil
     }
     private func stopMeter() { meterTimer?.invalidate(); meterTimer = nil }
     private func stopGrace() { graceTimer?.invalidate(); graceTimer = nil }
@@ -414,34 +563,85 @@ private final class IndicatorView: NSView {
         }
     }
 
-    private func finish(kind: String) {
+    /// The outcome grows out of whatever is on screen: the waiting breath at this instant, or the frozen orb
+    /// when recognition beat the grace. Then the plate retracts as before.
+    func finish(_ kind: Outcome) {
+        let now = CACurrentMediaTime()
+        let from: Breath = phase == .processing ? breath(at: now - waitStart) : Breath(orbR: frozenOrbR, halo: 1, rings: [])
+        let wasVisible = phase != .hidden
         stopAll()
+        if !wasVisible, style == .notch { plateW = retractedW; slide(to: expandedW) }
         phase = .finishing
-        let silent = (kind == "ok")   // dictation success is silent (no glyph) — the inserted text is the confirmation
-        let FADE = 0.16, GSTART = 0.09, GDRAW = 0.22, HOLD = 0.7, RETRACT = 0.36
-        let GEND = GSTART + GDRAW
-        let RSTART = silent ? FADE : (GEND + HOLD)
-        let start = CACurrentMediaTime()
-        var fromW: CGFloat? = nil
-        animTimer = Timer.scheduledTimer(withTimeInterval: ANIM_INTERVAL, repeats: true) { [weak self] _ in
+        glyph = nil; dotsAlpha = 0; retractFrom = nil
+        outcome = (kind, now, from)
+        let dur = Self.duration(kind), RETRACT = 0.36
+        let timer = Timer(timeInterval: ANIM_INTERVAL, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self else { return }
-                let t = CACurrentMediaTime() - start
-                if t <= FADE { let p = t / FADE, e = 1 - (1 - p) * (1 - p); self.dotsAlpha = CGFloat(1 - e) }
-                if !silent, t >= GSTART, t <= GEND {
-                    let p = min(1, (t - GSTART) / GDRAW)
-                    self.glyph = (kind, CGFloat(1 - (1 - p) * (1 - p)), 1)
-                }
-                if t > RSTART {
-                    let p = min(1, (t - RSTART) / RETRACT), e = p * p * (3 - 2 * p)   // smoothstep
-                    if fromW == nil { fromW = self.plateW }
-                    if self.style == .notch { self.plateW = fromW! + (self.retractedW - fromW!) * CGFloat(e) }
-                    if !silent { self.glyph = (kind, 1, CGFloat(1 - e)) }
-                    if p >= 1 { self.animTimer?.invalidate(); self.animTimer = nil; self.hide() }
+                guard let self, let o = self.outcome else { return }
+                let t = CACurrentMediaTime() - o.start
+                if t > dur, self.pinned { self.outcome = nil; self.enterPinnedRest(fresh: false, quietFor: 3.0); return }
+                if t > dur {
+                    let p = min(1, (t - dur) / RETRACT), e = p * p * (3 - 2 * p)
+                    if self.retractFrom == nil { self.retractFrom = self.plateW }
+                    if self.style == .notch, let fromW = self.retractFrom { self.plateW = fromW + (self.retractedW - fromW) * CGFloat(e) }
+                    if p >= 1 { self.animTimer?.invalidate(); self.animTimer = nil; self.outcome = nil; self.hide() }
                 }
                 self.needsDisplay = true
             }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        procTimer = timer   // slide() may own animTimer for a moment; stopAll() invalidates both
+    }
+
+    private static func duration(_ kind: Outcome) -> Double {
+        // Kept asks for an action (put the text back), so it stays long enough to notice after switching windows;
+        // a new dictation clears it at once (recording() stops everything).
+        switch kind { case .inserted: return 0.55; case .kept: return 5.0; case .failed: return 2.5; case .journaled: return 0.9 }
+    }
+
+    // MARK: the waiting breath (the Welcome logo's law, scaled to the ear)
+
+    struct Ring { var r: CGFloat; var a: CGFloat; var w: CGFloat }
+    struct Breath { var orbR: CGFloat; var halo: CGFloat; var rings: [Ring] }
+
+    /// The mark's rings for an orb of 4.5: the icon's spacing, loudness r1/r sets weight and brightness.
+    private static let logoR: [CGFloat] = [5.84, 7.65, 9.45, 11.26, 13.13]
+    private static var loud: [CGFloat] { logoR.map { logoR[0] / $0 } }
+    private static func gauss(_ x: CGFloat) -> CGFloat { exp(-x * x / 2) }
+    private static func smooth(_ t: CGFloat) -> CGFloat { let x = max(0, min(1, t)); return x * x * (3 - 2 * x) }
+    private static func span(_ t: CGFloat, _ a: CGFloat, _ b: CGFloat) -> CGFloat { max(0, min(1, (t - a) / (b - a))) }
+    private static func easeOut(_ t: CGFloat) -> CGFloat { 1 - pow(1 - max(0, min(1, t)), 3) }
+    /// A pressure pulse: compression (out + bright), then rarefaction (slightly in + dim).
+    private static func pulseShape(_ x: CGFloat) -> CGFloat { gauss(x) - 0.42 * gauss((x - 1.35) / 0.8) }
+
+    private var frozenOrbR: CGFloat { M_BASE + M_GROW * meterLevel + 0.75 * meterPulse }
+
+    /// The breath `w` seconds into waiting: the rings step out of the orb (0.45 s), then a pulse leaves the
+    /// orb every 1.1 s; after 3 s it grows fainter and rarer (calm by 5 s) so a long recognition never nags.
+    private func breath(at w: Double) -> Breath {
+        let W = CGFloat(w), k = Self.easeOut(W / 0.25)
+        let orbR = frozenOrbR + k * (4.2 - frozenOrbR)
+        if reduceMotion { return Breath(orbR: 4.2, halo: 0.8, rings: []) }
+        let calm = Self.smooth((W - 3) / 2), period = 1.1 + 0.9 * calm
+        let x = W.truncatingRemainder(dividingBy: period) / 0.85
+        let intro = Self.smooth(W / 0.45), gain = 1 - 0.45 * calm
+        let front = 3.9 + (15.53 - 3.9) * x
+        var rings: [Ring] = []
+        for (i, r0) in Self.logoR.enumerated() {
+            let L = Self.loud[i], lw = max(0.7, 1.5 * L), base = max(0.3, pow(L, 1.5)) * 0.55
+            var r = r0, op: CGFloat
+            if x <= 1 {
+                let sh = L * Self.pulseShape((front - r0) / 1.05) * gain, b = max(0, sh), dim = min(1, max(0, -sh))
+                op = i < 4 ? min(1, base + (1 - base) * 0.75 * b) * (1 - 0.35 * dim) : 0.5 * min(1, b * 2.2)
+                r = r0 + 1.1 * sh
+            } else {
+                op = i < 4 ? base : 0
+            }
+            if i < 4 { r = 4.5 + (r - 4.5) * Self.smooth(Self.span(W, CGFloat(i) * 0.07, 0.3 + CGFloat(i) * 0.07)) }
+            rings.append(Ring(r: r, a: k * intro * op, w: lw))
+        }
+        let kick = x <= 1 ? Self.gauss((front - 4.5) / 1.4) : 0
+        return Breath(orbR: orbR * (1 + 0.06 * kick), halo: 0.75 + 0.6 * kick, rings: rings)
     }
 
     // MARK: drawing (immediate mode)
@@ -453,17 +653,153 @@ private final class IndicatorView: NSView {
         ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
         ctx.fillPath()
 
+        drawJournalCue(ctx)
         switch phase {
         case .recording, .holding: drawOrb(ctx)
-        case .processing, .preparing: drawDots(ctx)
+        case .processing: drawBreath(ctx, breath(at: CACurrentMediaTime() - waitStart))
+        case .pinned: drawPinned(ctx)
+        case .unpinning: drawUnpinning(ctx)
+        case .preparing: drawDots(ctx)
         case .countdown: drawCountdownOrb(ctx); drawRing(ctx)
         case .download: drawCountdownOrb(ctx); drawRing(ctx)   // calm orb + a ring that FILLS with progress
         case .hint: drawCountdownOrb(ctx); if let g = glyph { drawGlyph(ctx, g) }
         case .finishing:
-            if dotsAlpha > 0.001 { drawDots(ctx) }
-            if let g = glyph { drawGlyph(ctx, g) }
+            if let o = outcome { drawOutcome(ctx, o.kind, o.from, CGFloat(CACurrentMediaTime() - o.start)) }
         case .hidden: break
         }
+    }
+
+    private func strokeRing(_ ctx: CGContext, _ r: CGFloat, _ a: CGFloat, _ w: CGFloat, _ c: (CGFloat, CGFloat, CGFloat) = ACCENT_LO) {
+        guard a > 0.003, r > 0.3 else { return }
+        ctx.setStrokeColor(cg(c, min(1, a))); ctx.setLineWidth(w)
+        ctx.addEllipse(in: CGRect(x: orbCx - r, y: orbCy - r, width: r * 2, height: r * 2)); ctx.strokePath()
+    }
+
+    /// The sphere at radius `r`, its halo and sheen; `a` fades the whole orb, `col`/`hi` recolour it.
+    private func drawSphere(_ ctx: CGContext, r: CGFloat, a: CGFloat = 1, halo: CGFloat = 1,
+                            col: (CGFloat, CGFloat, CGFloat) = ACCENT_LO, hi: (CGFloat, CGFloat, CGFloat) = ACCENT_HI) {
+        guard a > 0.003, r > 0.3 else { return }
+        radial(ctx, cx: orbCx, cy: orbCy, r: r * 2.1, inner: cg(col, 0.38 * a * halo), outer: cg(col, 0), offset: 0)
+        radial(ctx, cx: orbCx, cy: orbCy, r: max(r, 0.5), inner: cg(hi, a), outer: cg(col, a), offset: -0.2)
+        if a > 0.6 { drawSheen(ctx, r: r) }
+    }
+
+    private func clipToPlate(_ ctx: CGContext) { ctx.addPath(platePath(plateW, plateH)); ctx.clip() }
+
+    /// One echo leaving an orb of radius r0, `p` 0..1 over its travel, fading by r1/r.
+    private func echo(_ ctx: CGContext, _ p: CGFloat, _ strength: CGFloat, _ r0: CGFloat) {
+        guard p > 0, p < 1 else { return }
+        let r = r0 + (12.5 - r0) * Self.easeOut(p), L = r0 / r
+        strokeRing(ctx, r, strength * pow(L, 0.8) * (p < 0.08 ? p / 0.08 : 1), max(0.8, 1.6 * L))
+    }
+
+    private func drawPinned(_ ctx: CGContext) {
+        ctx.saveGState(); clipToPlate(ctx); defer { ctx.restoreGState() }
+        let u = CGFloat(CACurrentMediaTime() - pinStart)
+        if hover { drawSphere(ctx, r: 4.4, a: 1, halo: 1.3); return }
+        drawSphere(ctx, r: 3.3, a: 0.85, halo: 0.8)
+        if reduceMotion { return }
+        if u < 1.2 { echo(ctx, Self.span(u, 0.15, 0.95), 1.0, 3.6) }   // the pin took
+        else { echo(ctx, (u - 1.2).truncatingRemainder(dividingBy: 3.5) / 1.1, 0.8, 3.6) }   // visible, still calm (was too faint)
+    }
+
+    private func drawUnpinning(_ ctx: CGContext) {
+        ctx.saveGState(); clipToPlate(ctx); defer { ctx.restoreGState() }
+        let u = CGFloat(CACurrentMediaTime() - unpinStart)
+        let f = 1 - Self.easeOut(Self.span(u, 0.15, 0.6))
+        drawSphere(ctx, r: 3.2 * f + 0.1, a: 0.75 * f, halo: 0.7)
+        echo(ctx, Self.span(u, 0, 0.7), 0.8, 3.6)
+    }
+
+    private func drawBreath(_ ctx: CGContext, _ b: Breath) {
+        ctx.saveGState(); clipToPlate(ctx)
+        for ring in b.rings { strokeRing(ctx, ring.r, ring.a, ring.w) }
+        drawSphere(ctx, r: b.orbR, halo: b.halo)
+        ctx.restoreGState()
+    }
+
+    private static func mix(_ a: (CGFloat, CGFloat, CGFloat), _ b: (CGFloat, CGFloat, CGFloat), _ t: CGFloat) -> (CGFloat, CGFloat, CGFloat) {
+        (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t, a.2 + (b.2 - a.2) * t)
+    }
+
+    private func drawOutcome(_ ctx: CGContext, _ kind: Outcome, _ b: Breath, _ u: CGFloat) {
+        ctx.saveGState(); clipToPlate(ctx); defer { ctx.restoreGState() }
+        let S = Self.self
+        if reduceMotion {   // the final shape, cross-faded in, no travel
+            let f = 1 - S.span(u, CGFloat(S.duration(kind)) - 0.3, CGFloat(S.duration(kind)))
+            switch kind {
+            case .inserted: drawSphere(ctx, r: b.orbR, a: 1 - S.smooth(u / 0.3))
+            case .kept: strokeRing(ctx, 7.4, f, 1.9); drawSphere(ctx, r: 3.5, a: f)
+            case .failed: strokeRing(ctx, 3.9, f, 1.4, REDC)
+            case .journaled:
+                for (i, r) in S.logoR.prefix(4).enumerated() { strokeRing(ctx, r, f * S.restA(i), S.restW(i)) }
+                drawSphere(ctx, r: pinned ? 3.3 : 4.4, a: pinned ? 0.85 : f)
+            }
+            return
+        }
+        switch kind {
+        case .inserted:   // the last ring goes out past the edge, the standing rings go with it
+            let q = S.easeOut(u / 0.45)
+            for ring in b.rings { strokeRing(ctx, ring.r + 4 * q, ring.a * (1 - q), ring.w * (1 - 0.4 * q)) }
+            let r = 4.6 + 11 * q
+            strokeRing(ctx, r, 0.7 * (4.6 / r) * (1 - S.span(u, 0.3, 0.5)), max(0.6, 1.6 * 4.6 / r))
+            if pinned {   // "settles back": the orb never leaves, it eases to the resting orb
+                let q = S.smooth(S.span(u, 0.05, 0.55))
+                drawSphere(ctx, r: b.orbR + (3.3 - b.orbR) * q, a: 1 - 0.15 * q, halo: b.halo + (0.8 - b.halo) * q)
+            } else {
+                drawSphere(ctx, r: b.orbR, a: 1 - S.easeOut(S.span(u, 0.1, 0.45)), halo: b.halo)
+            }
+        case .kept:       // the nearest ring stops, brightens, thickens and closes round a smaller orb; held
+            let q = S.easeOut(u / 0.3), f = 1 - S.span(u, 4.7, 5.0)
+            for (i, ring) in b.rings.enumerated() where i > 0 { strokeRing(ctx, ring.r + 2 * q, ring.a * (1 - q), ring.w) }
+            let r0 = b.rings.first?.r ?? 5.8
+            ctx.saveGState()
+            ctx.setShadow(offset: .zero, blur: 5, color: cg(ACCENT_LO, 0.55 * q * f))
+            strokeRing(ctx, r0 + (7.4 - r0) * q, (0.55 + 0.45 * q) * f, 1.3 + 0.6 * q)
+            ctx.restoreGState()
+            drawSphere(ctx, r: b.orbR + (3.5 - b.orbR) * q, a: pinned ? 1 - 0.15 * S.smooth(S.span(u, 4.4, 5.0)) : f, halo: b.halo)
+        case .failed:     // the source goes out: a red pulse leaves, the rings lose their light, the orb empties
+            let red = S.smooth(u / 0.14), f = 1 - S.span(u, 2.2, 2.5), empty = S.smooth(S.span(u, 0.14, 0.3))
+            for ring in b.rings { strokeRing(ctx, ring.r, ring.a * (1 - S.easeOut(S.span(u, 0.05, 0.3))), ring.w) }
+            let p = S.span(u, 0, 0.3), rp = 4.8 + 6 * S.easeOut(p)
+            strokeRing(ctx, rp, 0.8 * (1 - p), 1.3, REDC)
+            let c = S.mix(ACCENT_LO, REDC, red), h = S.mix(ACCENT_HI, (1.0, 0.55, 0.5), red)
+            drawSphere(ctx, r: b.orbR, a: f * (1 - empty), halo: b.halo * (1 - empty), col: c, hi: h)
+            strokeRing(ctx, b.orbR - 0.6, f * empty, 1.4, REDC)
+            if pinned { drawSphere(ctx, r: 3.3, a: 0.85 * S.smooth(S.span(u, 2.1, 2.5)), halo: 0.8) }   // back to rest
+        case .journaled:  // the mark comes to rest: the four rings settle into the logo, still, then all fade as one
+            let q = S.smooth(S.span(u, 0, 0.25)), f = 1 - S.easeOut(S.span(u, 0.5, 0.9))
+            for i in 0..<4 {
+                let x = i < b.rings.count ? b.rings[i] : Ring(r: S.logoR[i], a: 0, w: S.restW(i))
+                strokeRing(ctx, x.r + (S.logoR[i] - x.r) * q, f * (x.a + (S.restA(i) - x.a) * q), S.restW(i))
+            }
+            if pinned {   // settles back to the resting orb instead of leaving
+                let s = S.smooth(S.span(u, 0.3, 0.9))
+                drawSphere(ctx, r: b.orbR + (3.3 - b.orbR) * s, a: 1 - 0.15 * s, halo: b.halo + (0.8 - b.halo) * s)
+            } else {
+                drawSphere(ctx, r: b.orbR + (4.4 - b.orbR) * q, a: f, halo: b.halo * (1 - 0.3 * q))
+            }
+        }
+    }
+
+    /// The logo at rest: each of the four standing rings at its loudness (r1/r) weight and calm brightness.
+    private static func restA(_ i: Int) -> CGFloat { max(0.3, pow(loud[i], 1.5)) * 0.75 }
+    private static func restW(_ i: Int) -> CGFloat { max(0.7, 1.5 * loud[i]) }
+
+    /// The thin still ring round the orb while a Journal-only take is spoken and recognised; it fades in at
+    /// the press and leaves with the ending.
+    private func drawJournalCue(_ ctx: CGContext) {
+        guard journalCue else { return }
+        var a: CGFloat
+        switch phase {
+        case .recording, .holding, .processing, .countdown:
+            a = reduceMotion ? 1 : Self.smooth(CGFloat(CACurrentMediaTime() - journalCueStart) / 0.2)
+        case .finishing:
+            guard let o = outcome else { return }
+            a = 1 - Self.smooth(CGFloat(CACurrentMediaTime() - o.start) / 0.25)
+        default: return
+        }
+        ctx.saveGState(); clipToPlate(ctx); strokeRing(ctx, 9.4, 0.32 * a, 0.9); ctx.restoreGState()
     }
 
     // Countdown: a calm static orb (crisp, faint glow) and a depleting ring around it.

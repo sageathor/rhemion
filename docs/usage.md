@@ -9,22 +9,24 @@
 | Stop hands-free automatically | After 30 s of silence a 10 s countdown ring appears, then recording stops |
 | Cancel the current recording | Double-tap **Esc** while recording |
 | Erase the text just inserted | Double-tap **Esc** right after it appears (within 8 s) |
+| Save to the Journal only, insert nothing | Hold **Shift** while pressing the dictation key |
+| Send every dictation to one window | **⌥⌘P** in that window (again to unpin), or the menu bar icon › **Pin to this window** |
 | Insert the last dictation again | **⌥⌘R** |
 | Add a word to the dictionary | Select it, press **⌥⌘W** |
 | Undo the last dictionary replacement | **⇧⌥⌘L** (within 8 s) |
+| See every shortcut | Menu bar icon › **Keyboard Shortcuts…** (⌘/) |
 | Open Rhemion | Menu bar icon › **Open Rhemion…** (⌘0), or click the Dock icon |
 | Close Rhemion's windows | **⌘Q**. Rhemion keeps running in the menu bar |
 | Quit Rhemion | **⌥⌘Q**, or menu bar icon › **Quit Rhemion** |
 
 Where to change them:
 
-- **Settings › General**: the push-to-talk key (several keys can be added).
-- **Settings › Shortcuts**: Recall, Dictionary add, Undo replacement (each can have several shortcuts).
+- **Settings › Shortcuts**: every keyboard action, in the order you use it. The dictation key (several keys can be added); hands-free, Cancel, Journal only and Erase, each with an on/off switch; Recall, Pin to this window, Add to dictionary and Undo replacement (each can have several shortcuts); and apps that keep Esc twice for themselves.
 - **Settings › Recording**: the double-Esc timing, the 8-second reversal window, and the hands-free silence and countdown times.
 
 ## Recording indicator
 
-While Rhemion listens, an amber indicator appears at the notch, or as a small pill below the menu bar on Macs without a notch. It grows with your voice, turns into a spinner while the text is recognized, shows a short mark when it is done, and a countdown ring before hands-free recording stops on its own. Settings › General › Recording indicator: Auto, Notch or Floating.
+While Rhemion listens, an amber indicator appears at the notch, or as a small pill below the menu bar on Macs without a notch. It grows with your voice, sends out calm waves while the text is recognized, and shows how the dictation ended: the waves go out when the text is in, a ring holds when it is kept in the Journal, the orb empties in red when nothing was recognized. It also shows a countdown ring before hands-free recording stops on its own. Settings › General › Recording indicator: Auto, Notch or Floating.
 
 ## How text is inserted
 

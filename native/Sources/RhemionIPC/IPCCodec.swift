@@ -18,6 +18,7 @@ public enum IPCCodec {
             obj = #"{"event":"deliver","session":\#(jsonString(session)),"text":\#(jsonString(text))\#(tail)}"#
         case .error(let m):   obj = #"{"event":"error","message":\#(jsonString(m))}"#
         case .canceled(let s): obj = #"{"event":"canceled","session":\#(jsonString(s))}"#
+        case .journaled(let s): obj = #"{"event":"journaled","session":\#(jsonString(s))}"#
         case .historyDeleted(let ids, let removedIDs, let error):
             let tail = error.map { #","error":\#(jsonString($0))"# } ?? ""
             obj = #"{"event":"history-deleted","ids":\#(jsonStrings(ids)),"removed_ids":\#(jsonStrings(removedIDs))\#(tail)}"#
@@ -36,6 +37,9 @@ public enum IPCCodec {
             let m = jsonArray(models.map { ["id": $0.id, "label": $0.label, "engine": $0.engine, "found": $0.found, "warm": $0.warm, "damaged": $0.damaged] })
             let d = jsonArray(mics.map { ["uid": $0.uid, "name": $0.name, "built_in": $0.builtIn] })
             obj = #"{"event":"devices","models":\#(m),"mics":\#(d)}"#
+        case .rerecognized(let id, let ok, let error):
+            let tail = error.map { #","error":\#(jsonString($0))"# } ?? ""
+            obj = #"{"event":"rerecognized","id":\#(jsonString(id)),"ok":\#(ok)\#(tail)}"#
         }
         return obj + "\n"
     }
@@ -51,8 +55,14 @@ public enum IPCCodec {
             if let pressedAt { tail += #","ts":\#(jsonNumber(pressedAt))"# }
             if let targetPid { tail += #","target_pid":\#(targetPid)"# }
             obj = #"{"cmd":"start"\#(tail)}"#
+        case .startJournal(let pressedAt, let targetPid):
+            var tail = ""
+            if let pressedAt { tail += #","ts":\#(jsonNumber(pressedAt))"# }
+            if let targetPid { tail += #","target_pid":\#(targetPid)"# }
+            obj = #"{"cmd":"start","journal":true\#(tail)}"#
         case .stop: obj = #"{"cmd":"stop"}"#
         case .cancel: obj = #"{"cmd":"cancel"}"#
+        case .cancelKeeping: obj = #"{"cmd":"cancel","keep":true}"#
         case .historyDelete(let ids):
             obj = #"{"cmd":"history-delete","ids":\#(jsonStrings(ids))}"#
         case .exportNow: obj = #"{"cmd":"export-now"}"#
@@ -61,6 +71,7 @@ public enum IPCCodec {
             obj = #"{"cmd":"download-model","id":\#(jsonString(id))}"#
         case .cancelModelDownload: obj = #"{"cmd":"cancel-model-download"}"#
         case .listDevices: obj = #"{"cmd":"list-devices"}"#
+        case .rerecognize(let id): obj = #"{"cmd":"rerecognize","id":\#(jsonString(id))}"#
         case .deliverResult(let session, let status):
             obj = #"{"cmd":"deliver-result","session":\#(jsonString(session)),"status":\#(jsonString(status))}"#
         }
@@ -79,10 +90,11 @@ public enum IPCCodec {
             else { continue }
             switch cmd {
             case "start":
-                commands.append(.start(pressedAt: numericTimestamp(obj["ts"]),
-                                       targetPid: integerValue(obj["target_pid"])))
+                let (ts, pid) = (numericTimestamp(obj["ts"]), integerValue(obj["target_pid"]))
+                commands.append((obj["journal"] as? Bool) == true ? .startJournal(pressedAt: ts, targetPid: pid)
+                                                                   : .start(pressedAt: ts, targetPid: pid))
             case "stop":  commands.append(.stop)
-            case "cancel": commands.append(.cancel)
+            case "cancel": commands.append((obj["keep"] as? Bool) == true ? .cancelKeeping : .cancel)
             case "history-delete":
                 if let ids = obj["ids"] as? [String] { commands.append(.historyDelete(ids: ids)) }
             case "export-now": commands.append(.exportNow)
@@ -91,6 +103,8 @@ public enum IPCCodec {
                 if let id = obj["id"] as? String { commands.append(.downloadModel(id: id)) }
             case "cancel-model-download": commands.append(.cancelModelDownload)
             case "list-devices": commands.append(.listDevices)
+            case "rerecognize":
+                if let id = obj["id"] as? String, !id.isEmpty { commands.append(.rerecognize(id: id)) }
             case "deliver-result":
                 // Ignore a malformed result rather than fabricate one: an absent/empty session or
                 // status carries no truth about a delivery, so drop it (the runtime's timeout still
@@ -135,6 +149,8 @@ public enum IPCCodec {
                 }
             case "canceled":
                 if let s = obj["session"] as? String { events.append(.canceled(session: s)) }
+            case "journaled":
+                if let s = obj["session"] as? String { events.append(.journaled(session: s)) }
             case "error":
                 if let m = obj["message"] as? String { events.append(.error(message: m)) }
             case "history-deleted":
@@ -150,6 +166,10 @@ public enum IPCCodec {
                 }
             case "pong":
                 events.append(.pong)
+            case "rerecognized":
+                if let id = obj["id"] as? String, let ok = obj["ok"] as? Bool {
+                    events.append(.rerecognized(id: id, ok: ok, error: obj["error"] as? String))
+                }
             case "level":
                 if let rms = doubleValue(obj["rms"]) { events.append(.level(rms: rms)) }
             case "model-download":

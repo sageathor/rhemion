@@ -2,6 +2,7 @@
 // delayed restore is deliberately decoupled from completion so the delivery FIFO can advance.
 
 @preconcurrency import AppKit
+import Carbon.HIToolbox
 @preconcurrency import CoreGraphics
 import Foundation
 import Security
@@ -14,13 +15,58 @@ enum ClipboardPaste {
     static func paste(
         _ text: String,
         targetPid: Int?,
+        settleMS: Int = 0,
+        stillTarget: (@Sendable () -> Bool)? = nil,
         completion: @escaping (PasteStatus) -> Void
     ) {
-        Engine.shared.paste(text, targetPid: targetPid, completion: completion)
+        Engine.shared.paste(text, targetPid: targetPid, settleMS: settleMS, stillTarget: stillTarget, completion: completion)
     }
 
     /// A clipboard marked by its owner as concealed (passwords) or transient (one-time codes), per the
     /// nspasteboard.org convention.
+    /// V for ⌘V, worked out on the main thread (Text Input Sources must not be called from the paste queue:
+    /// that traps) at launch and whenever the keyboard layout changes; the paste only reads it.
+    static let vKey = Locked<CGKeyCode>(0x09)
+    /// The tag of the latest posted paste (read in the completion, which runs right after it is set): lets the
+    /// caller hand the user's clipboard back as soon as it sees the text land (`restoreNow`).
+    static let lastPostedToken = Locked<String?>(nil)
+    /// The text was seen in the field: the app has read the clipboard, so the user's own clipboard can go back
+    /// now. Only the restore of THAT paste (by its tag); a newer paste's pending restore is never touched.
+    static func restoreNow(token: String) { Engine.shared.restoreNow(token: token) }
+    /// When nothing confirms the paste (a field that cannot be read), the user's clipboard goes back after this
+    /// long. It used to be 250 ms, but Chrome sometimes reads the clipboard later than that (a busy page),
+    /// and then pasted the user's OLD clipboard instead of the dictation (bench: 2 in about 700 pastes).
+    static let fallbackRestoreMS = 1_500
+    private nonisolated(unsafe) static var layoutObserver: NSObjectProtocol?
+
+    @MainActor static func trackKeyboardLayout() {
+        vKey.value = vKeyCode()
+        guard layoutObserver == nil else { return }
+        layoutObserver = DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String), object: nil, queue: .main
+        ) { _ in MainActor.assumeIsolated { vKey.value = vKeyCode() } }
+    }
+
+    /// The key code that types "v" in the keyboard layout macOS uses for shortcuts (the current ASCII-capable
+    /// layout: Dvorak puts V elsewhere; a Russian layout pairs with ABC/US, where it is 0x09). Falls back to 0x09.
+    /// Main thread only.
+    @MainActor static func vKeyCode() -> CGKeyCode {
+        guard let source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
+              let raw = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return 0x09 }
+        let data = Unmanaged<CFData>.fromOpaque(raw).takeUnretainedValue() as Data
+        return data.withUnsafeBytes { buffer -> CGKeyCode in
+            guard let layout = buffer.baseAddress?.assumingMemoryBound(to: UCKeyboardLayout.self) else { return 0x09 }
+            for code in 0..<UInt16(128) {
+                var dead: UInt32 = 0, length = 0
+                var chars = [UniChar](repeating: 0, count: 4)
+                let status = UCKeyTranslate(layout, code, UInt16(kUCKeyActionDown), 0, UInt32(LMGetKbdType()),
+                                            OptionBits(kUCKeyTranslateNoDeadKeysBit), &dead, 4, &length, &chars)
+                if status == noErr, length == 1, chars[0] == UniChar(UInt8(ascii: "v")) { return CGKeyCode(code) }
+            }
+            return 0x09
+        }
+    }
+
     static func isSensitive(_ snapshot: [[String: Data]]) -> Bool {
         snapshot.contains { item in
             item.keys.contains("org.nspasteboard.ConcealedType") || item.keys.contains("org.nspasteboard.TransientType")
@@ -37,6 +83,8 @@ enum ClipboardPaste {
         let changeCount: Int
         let token: String
         var workItem: DispatchWorkItem?
+        /// When its ⌘V went out: the next paste waits for this one to be read.
+        let postedAt = DispatchTime.now()
 
         init(savedOriginal: [[String: Data]], changeCount: Int, token: String) {
             self.savedOriginal = savedOriginal
@@ -58,13 +106,26 @@ enum ClipboardPaste {
         func paste(
             _ text: String,
             targetPid: Int?,
+            settleMS: Int,
+            stillTarget: (@Sendable () -> Bool)?,
             completion: @escaping (PasteStatus) -> Void
         ) {
             let callback = Callback(completion)
-            queue.async { self.begin(text, targetPid: targetPid, callback: callback) }
+            queue.async { self.begin(text, targetPid: targetPid, settleMS: settleMS, stillTarget: stillTarget, callback: callback) }
         }
 
-        private func begin(_ text: String, targetPid: Int?, callback: Callback) {
+        /// How long the next paste waits for the previous one to be seen in its field before writing the clipboard.
+        /// Overwriting it earlier could hand the previous ⌘V the NEXT text when the app reads the clipboard late
+        /// (Chrome, a busy page). Confirmation (`restoreNow`) ends the wait at once; an unreadable field waits it out.
+        static let readWaitMS = 800
+
+        private func begin(_ text: String, targetPid: Int?, settleMS: Int, stillTarget: (@Sendable () -> Bool)?, callback: Callback) {
+            if let pending, DispatchTime.now() < pending.postedAt + .milliseconds(Self.readWaitMS) {
+                queue.asyncAfter(deadline: .now() + .milliseconds(10)) {
+                    self.begin(text, targetPid: targetPid, settleMS: settleMS, stillTarget: stillTarget, callback: callback)
+                }
+                return
+            }
             guard !text.isEmpty else { callback.body(.pasteNotPosted); return }
             guard targetMatches(targetPid) else { callback.body(.targetChanged); return }
             guard let source = CGEventSource(stateID: .privateState) else {
@@ -101,9 +162,19 @@ enum ClipboardPaste {
             state.watchdog = watchdog
             queue.asyncAfter(deadline: .now() + .milliseconds(1_500), execute: watchdog)
 
-            queue.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self, state] in
+            // ⌘V goes out as soon as the user's own keys are up (a Recall chord, a late push-to-talk release):
+            // a held modifier would turn ⌘V into another shortcut. No fixed settle otherwise: the insertion
+            // bench (Chrome and Safari, React fields included) found none needed.
+            queue.asyncAfter(deadline: .now() + .milliseconds(settleMS)) { [weak self, state] in
+              self?.whenKeysUp(until: .now() + .milliseconds(600), state: state) { [weak self, state] in
                 guard let self, !state.completed else { return }
                 guard self.targetMatches(targetPid) else {
+                    self.restoreIfOwned(savedOriginal, changeCount: changeCount, token: token)
+                    self.complete(state, .targetChanged)
+                    return
+                }
+                // The field may have changed while the keys were up-waiting: check it again right before ⌘V.
+                if let stillTarget, !stillTarget() {
                     self.restoreIfOwned(savedOriginal, changeCount: changeCount, token: token)
                     self.complete(state, .targetChanged)
                     return
@@ -115,10 +186,11 @@ enum ClipboardPaste {
                 }
 
                 // Construct all events before posting any, avoiding a half-built shortcut with a
-                // stuck Command key. 0x37 is left Command; 0x09 is V.
+                // stuck Command key. 0x37 is left Command; V comes from the shortcut layout (vKeyCode).
+                let vKey = ClipboardPaste.vKey.value   // V by the layout shortcuts use (Dvorak's V is not QWERTY's)
                 guard let cmdDown = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: true),
-                      let vDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true),
-                      let vUp = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false),
+                      let vDown = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: true),
+                      let vUp = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: false),
                       let cmdUp = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: false) else {
                     self.restoreIfOwned(savedOriginal, changeCount: changeCount, token: token)
                     self.complete(state, .pasteNotPosted)
@@ -128,7 +200,7 @@ enum ClipboardPaste {
                 vDown.flags = .maskCommand
                 vUp.flags = .maskCommand
 
-                // Last check before ⌘V: if the user copied something in the last 100 ms, the clipboard is
+                // Last check before ⌘V: if the user copied something since our write, the clipboard is
                 // theirs now. Pasting would insert THEIR content, so do not post, and leave it alone.
                 guard self.stillOwns(changeCount: changeCount, token: token) else {
                     self.complete(state, .pasteNotPosted)
@@ -145,7 +217,18 @@ enum ClipboardPaste {
                 cmdUp.post(tap: .cghidEventTap)
 
                 self.scheduleRestore(savedOriginal, changeCount: changeCount, token: token)
+                ClipboardPaste.lastPostedToken.value = token
                 self.complete(state, .pasteSubmitted)
+              }
+            }
+        }
+
+        /// Runs `body` once no modifier is held, or at `until` (body then sees the key still down and does not paste).
+        private func whenKeysUp(until: DispatchTime, state: CompletionState, _ body: @escaping () -> Void) {
+            guard !state.completed else { return }
+            if !modifiersHeld() || DispatchTime.now() >= until { body(); return }
+            queue.asyncAfter(deadline: .now() + .milliseconds(5)) { [weak self, state] in
+                self?.whenKeysUp(until: until, state: state, body)
             }
         }
 
@@ -180,7 +263,16 @@ enum ClipboardPaste {
                 )
             }
             record.workItem = work
-            queue.asyncAfter(deadline: .now() + .milliseconds(250), execute: work)
+            queue.asyncAfter(deadline: .now() + .milliseconds(ClipboardPaste.fallbackRestoreMS), execute: work)
+        }
+
+        func restoreNow(token: String) {
+            queue.async { [weak self] in
+                guard let self, let record = self.pending, record.token == token else { return }
+                record.workItem?.cancel()
+                self.pending = nil
+                self.restoreIfOwned(record.savedOriginal, changeCount: record.changeCount, token: record.token)
+            }
         }
 
         private func snapshot() -> [[String: Data]] {

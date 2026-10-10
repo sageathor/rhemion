@@ -40,7 +40,7 @@ final class DictAddPanelController: NSObject, NSWindowDelegate {
             window.delegate = self
             self.window = window
         }
-        window?.center()
+        if let window, !window.isVisible { centerOnPointerScreen(window) }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
     }

@@ -70,6 +70,17 @@ public final class ULIDGenerator: @unchecked Sendable {
 
 public protocol HistorySink: Sendable { func append(_ entry: HistoryEntry) async }
 
+/// New text for an entry whose recording was recognised again (3.1).
+public struct HistoryTextUpdate: Sendable, Equatable {
+    public let raw: String, clean: String, enhanced: String?, engine: String
+    public let processingDurationMS: Int?
+    public let deliveryError: String?
+    public init(raw: String, clean: String, enhanced: String?, engine: String, processingDurationMS: Int?, deliveryError: String?) {
+        self.raw = raw; self.clean = clean; self.enhanced = enhanced; self.engine = engine
+        self.processingDurationMS = processingDurationMS; self.deliveryError = deliveryError
+    }
+}
+
 struct HistoryRecord: Codable, Sendable {
     let id, ts, engine: String
     let ms, audio_duration_ms: Int?
@@ -79,6 +90,9 @@ struct HistoryRecord: Codable, Sendable {
     let delivery_method, delivery_error, app_name, app_bundle_id, audio: String?
     var audio_retained: Bool?
     let pre_dictionary: String?
+    /// The runtime session that produced the entry (3.1): the app keys its press-time target snapshot by it,
+    /// so the Journal's Insert again can put the text back where it was meant to go. Absent before 3.1.
+    var session: String? = nil
 }
 
 public struct HistoryReconcileResult: Sendable, Equatable {
@@ -254,6 +268,65 @@ private actor HistoryRenderer {
         } catch { HistoryStore.log("vault sync after mutation failed for \(month): \(error)") }
     }
 
+    /// 3.1: rewrite one entry's text after its recording was recognised again. Only that line changes (its other
+    /// fields, and every other line, are kept as they are); the month's note and the exported note follow.
+    func updateText(id: String, _ update: HistoryTextUpdate, stateDirectory: URL, historyDirectory: URL,
+                    calendar: Calendar) -> Bool {
+        // Re-adopt exact-match vault notes BEFORE the log changes, as append and delete do: afterwards an old,
+        // unregistered note no longer matches a render and would stay foreign with the old text.
+        if let directory = initializedVaultDirectory(stateDirectory: stateDirectory, historyDirectory: historyDirectory) {
+            do { try ExportNote.readopt(directory: directory, state: stateDirectory,
+                     registryURL: stateDirectory.appendingPathComponent(ExportRegistry.fileName), calendar: calendar) }
+            catch { HistoryStore.log("export adoption failed: \(error)") }
+        }
+        for month in HistoryStore.availableMonths(stateDirectory: stateDirectory, historyDirectory: historyDirectory) {
+            do {
+                guard try HistoryStore.rewriteLine(id: id, month: month, stateDirectory: stateDirectory, update: update)
+                else { continue }
+                do { _ = try HistoryStore.renderMonth(month, stateDirectory: stateDirectory,
+                                                      historyDirectory: historyDirectory, calendar: calendar) }
+                catch { HistoryStore.log("render after update failed for \(month): \(error)") }
+                syncVaultAfterMutation(month: month, stateDirectory: stateDirectory,
+                                       historyDirectory: historyDirectory, calendar: calendar)
+                return true
+            } catch { HistoryStore.log("history update failed for \(month): \(error)"); return false }
+        }
+        return false
+    }
+
+    /// Delete recordings no journal row points at, in EVERY month (startup only covers its own month otherwise):
+    /// finished WAVs whose entry id is in no month's log, and in-progress leftovers older than the recovery
+    /// window. Only files created before `cutoff` (this runtime's start). Rows are never touched.
+    func sweepOrphanAudio(createdBefore cutoff: Date, inProgressOlderThan staleCutoff: Date,
+                          stateDirectory: URL, historyDirectory: URL) -> Int {
+        let fm = FileManager.default
+        let months = HistoryStore.availableMonths(stateDirectory: stateDirectory, historyDirectory: historyDirectory)
+        var known = Set<String>()
+        for month in months {
+            for record in (try? HistoryStore.readRecords(month: month, stateDirectory: stateDirectory)) ?? [] {
+                known.insert(record.id.uppercased())
+                if let audio = record.audio, let owner = HistoryStore.idInAudioName(URL(fileURLWithPath: audio).lastPathComponent) {
+                    known.insert(owner)
+                }
+            }
+        }
+        var removed = 0
+        for month in months {
+            let audio = historyDirectory.appendingPathComponent("\(month)/Audio", isDirectory: true)
+            for name in (try? fm.contentsOfDirectory(atPath: audio.path)) ?? [] {
+                let url = audio.appendingPathComponent(name)
+                guard let created = (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate else { continue }
+                if name.hasPrefix("."), name.hasSuffix(".wav.in-progress") {
+                    guard created < staleCutoff else { continue }
+                } else if let id = HistoryStore.idInAudioName(name) {
+                    guard created < cutoff, !known.contains(id) else { continue }
+                } else { continue }
+                if (try? fm.removeItem(at: url)) != nil { removed += 1 }
+            }
+        }
+        return removed
+    }
+
     /// The configured export folder, only once export has been initialized (nil otherwise).
     private func initializedVaultDirectory(stateDirectory: URL, historyDirectory: URL) -> URL? {
         let settingsURL = stateDirectory.appendingPathComponent("active/settings.json")
@@ -284,6 +357,11 @@ private actor HistoryRenderer {
 }
 
 public actor HistoryStore: HistorySink {
+    /// Set by the runtime at launch (3.1 review): orphan-audio garbage collection only takes files created before
+    /// this moment, so a take of this process still being recognised (no journal row yet) is never collected.
+    /// Nil (CLI, tests): the 30 s age guard alone, as before.
+    public nonisolated(unsafe) static var orphanCutoff: Date?
+
     private let resolveHistoryDirectory: @Sendable () -> URL
     private let resolveStateDirectory: @Sendable () -> URL
     private let calendar: Calendar
@@ -366,6 +444,52 @@ public actor HistoryStore: HistorySink {
             }
     }
 
+    /// 3.1: the kept recording of a journal entry, when both the entry and its file are still there.
+    public func audioURL(forEntry id: String) -> URL? {
+        let stateDirectory = resolveStateDirectory(), historyDirectory = resolveHistoryDirectory()
+        for month in Self.availableMonths(stateDirectory: stateDirectory, historyDirectory: historyDirectory) {
+            guard let record = ((try? Self.readRecords(month: month, stateDirectory: stateDirectory)) ?? [])
+                .first(where: { $0.id == id }) else { continue }
+            guard record.audio_retained != false, let name = record.audio else { return nil }
+            let url = historyDirectory.appendingPathComponent("\(month)/Audio/\(URL(fileURLWithPath: name).lastPathComponent)")
+            return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        }
+        return nil
+    }
+
+    /// An entry's delivery error (nil when it has none or is gone).
+    public func deliveryError(forEntry id: String) -> String? {
+        let stateDirectory = resolveStateDirectory(), historyDirectory = resolveHistoryDirectory()
+        for month in Self.availableMonths(stateDirectory: stateDirectory, historyDirectory: historyDirectory) {
+            if let record = ((try? Self.readRecords(month: month, stateDirectory: stateDirectory)) ?? []).first(where: { $0.id == id }) {
+                return record.delivery_error
+            }
+        }
+        return nil
+    }
+
+    /// See HistoryRenderer.sweepOrphanAudio. Returns how many files went.
+    @discardableResult public func sweepOrphanAudio(createdBefore cutoff: Date, inProgressOlderThan staleCutoff: Date) async -> Int {
+        await renderer.sweepOrphanAudio(createdBefore: cutoff, inProgressOlderThan: staleCutoff,
+                                        stateDirectory: resolveStateDirectory(), historyDirectory: resolveHistoryDirectory())
+    }
+
+    /// Every journaled entry id (upper case), across all months: what the spool recovery must not touch.
+    public func knownIDs() -> Set<String> {
+        let stateDirectory = resolveStateDirectory(), historyDirectory = resolveHistoryDirectory()
+        var ids = Set<String>()
+        for month in Self.availableMonths(stateDirectory: stateDirectory, historyDirectory: historyDirectory) {
+            for record in (try? Self.readRecords(month: month, stateDirectory: stateDirectory)) ?? [] { ids.insert(record.id.uppercased()) }
+        }
+        return ids
+    }
+
+    /// 3.1: put new text on an entry (recognised again from its recording). False when the entry is gone.
+    public func updateText(id: String, _ update: HistoryTextUpdate) async -> Bool {
+        await renderer.updateText(id: id, update, stateDirectory: resolveStateDirectory(),
+                                  historyDirectory: resolveHistoryDirectory(), calendar: calendar)
+    }
+
     /// The newest non-empty `pre_dictionary` across the monthly logs, scanning months newest-first
     /// and, within a month, entries newest-first.
     public func lastPreDictionary() -> String? {
@@ -441,6 +565,8 @@ public actor HistoryStore: HistorySink {
             for name in audioNames {
                 guard let id = idInAudioName(name), !keepIDs.contains(id) else { continue }
                 let url = audioDirectory.appendingPathComponent(name)
+                if let cutoff = orphanCutoff,
+                   ((try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantFuture) >= cutoff { continue }
                 if let mtime = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
                    Date().timeIntervalSince(mtime) < 30 { continue }
                 if fm.fileExists(atPath: url.path) { try? fm.removeItem(at: url) }
@@ -524,6 +650,37 @@ public actor HistoryStore: HistorySink {
         return dropped
     }
 
+    /// Rewrite the single line whose `id` is `id` with `update` applied, keeping its other keys and every other
+    /// line's raw bytes. Returns false (file untouched) when the month has no such line.
+    static func rewriteLine(id: String, month: String, stateDirectory: URL, update: HistoryTextUpdate) throws -> Bool {
+        let directory = stateDirectory.appendingPathComponent("log", isDirectory: true)
+        let url = directory.appendingPathComponent("dictate-\(month).jsonl")
+        guard let data = try? Data(contentsOf: url) else { return false }
+        var out = Data(); var found = false
+        for line in data.split(separator: 0x0a, omittingEmptySubsequences: true) {
+            if !found, var object = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
+               object["id"] as? String == id {
+                found = true
+                object["raw"] = update.raw; object["clean"] = update.clean
+                object["enhanced"] = update.enhanced ?? NSNull()
+                object["engine"] = update.engine
+                object["ms"] = update.processingDurationMS ?? NSNull()
+                object["delivery_error"] = update.deliveryError ?? NSNull()
+                out.append(try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]))
+                out.append(0x0a); continue
+            }
+            out.append(contentsOf: line); out.append(0x0a)
+        }
+        guard found else { return false }
+        let temporary = directory.appendingPathComponent(".dictate-\(month).\(UUID().uuidString).tmp")
+        do {
+            try out.write(to: temporary)
+            let handle = try FileHandle(forWritingTo: temporary); try handle.synchronize(); try handle.close()
+            guard Darwin.rename(temporary.path, url.path) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        } catch { try? FileManager.default.removeItem(at: temporary); throw error }
+        return true
+    }
+
     /// Flip `audio_retained` to false on the rows whose audio file is in `names` (raw-line rewrite;
     /// shared with the app's Clear Data › Recordings — `HistoryNote.markAudioNotRetained`).
     static func markAudioNotRetained(names: Set<String>, month: String, stateDirectory: URL) throws {
@@ -551,7 +708,7 @@ public actor HistoryStore: HistorySink {
                       delivered: e.delivered, delivery_method: e.deliveryMethod, delivery_error: e.deliveryError,
                       app_name: e.application?.name,
                       app_bundle_id: e.application?.bundleID, audio: e.audio.map { URL(fileURLWithPath: $0).lastPathComponent },
-                      audio_retained: e.audioRetained, pre_dictionary: e.preDictionary)
+                      audio_retained: e.audioRetained, pre_dictionary: e.preDictionary, session: e.sessionID)
     }
 
     static func readRecords(month: String, stateDirectory: URL) throws -> [HistoryRecord] {
@@ -609,7 +766,7 @@ public actor HistoryStore: HistorySink {
     private static func containsEntryID(_ ids: Set<String>, id: String) -> Bool {
         let id = id.uppercased(); return ids.contains(id) || ids.contains { id.hasPrefix($0) }
     }
-    private static func idInAudioName(_ name: String) -> String? {
+    static func idInAudioName(_ name: String) -> String? {
         guard name.lowercased().hasSuffix(".wav"), let separator = name.range(of: "--", options: .backwards) else { return nil }
         let id = String(name[separator.upperBound...].dropLast(4)).uppercased(); return id.count == 26 ? id : nil
     }

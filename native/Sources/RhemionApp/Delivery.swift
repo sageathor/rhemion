@@ -12,10 +12,17 @@ final class Delivery: @unchecked Sendable {
     /// count of the delivered text (Backspaces to erase it), `pid` = where it landed, `undoRaw` =
     /// boundary-spaced pre-dictionary text to restore on undo-replace (nil when this delivery was not
     /// a dictionary substitution — still deletable via double-Esc).
-    var onArmUndo: (@Sendable (_ deliveredN: Int, _ pid: Int, _ undoRaw: String?) -> Void)?
+    var onArmUndo: (@Sendable (_ deliveredN: Int, _ pid: Int, _ undoRaw: String?, _ session: String) -> Void)?
     /// Clear any armed reversal — called at the start of every delivery so only the most recent take
     /// is ever reversible (undo-replace or double-Esc delete).
     var onDisarmUndo: (@Sendable () -> Void)?
+    /// Compares the press-time target with the current focus for this session, right before inserting;
+    /// false = the focus left the target, so the text stays in the Journal (status `target-lost`).
+    var targetCheck: (@Sendable (_ session: String) -> Bool)?
+    /// Re-checks the press-time target right before ⌘V (true = still the target, or nothing to check).
+    var targetRecheck: (@Sendable (_ session: String) -> Bool)?
+    /// The text reached the field (AX write returned, or ⌘V posted) at this uptime: for the `felt` latency.
+    var onVisible: (@Sendable (_ session: String, _ at: UInt64) -> Void)?
 
     func onDeliver(
         text: String,
@@ -23,6 +30,7 @@ final class Delivery: @unchecked Sendable {
         session: String,
         targetPid: Int?,
         inputMethod: String,
+        checkTarget: Bool = true,
         sendAck: @escaping (String, String) -> Void,
         onResult: @escaping (String) -> Void
     ) {
@@ -35,6 +43,7 @@ final class Delivery: @unchecked Sendable {
             sendAck: sendAck,
             onResult: onResult
         )
+        item.checkTarget = checkTarget
         queue.async {
             self.items.append(item)
             self.pump()
@@ -50,6 +59,7 @@ final class Delivery: @unchecked Sendable {
         let sendAck: (String, String) -> Void
         let onResult: (String) -> Void
         var finished = false
+        var checkTarget = true   // false: the caller already put the focus where the text goes (a pinned window)
         var undoRaw: String?   // boundary-spaced pre-dictionary text to restore on undo (nil = not undoable)
         var undoN: Int?        // scalar count of the delivered text (Backspaces to select it)
 
@@ -82,8 +92,12 @@ final class Delivery: @unchecked Sendable {
         // Only the most recent dictation is ever undoable: clear any armed undo as each delivery starts.
         onDisarmUndo?()
         guard !item.text.isEmpty else { finish(item, status: "empty-delivery"); return }
+        if item.checkTarget, let targetCheck, !targetCheck(item.session) { finish(item, status: "target-lost"); return }
 
+        AXInsert.timing = [:]; AXInsert.writtenAt = nil
+        let tc = DispatchTime.now().uptimeNanoseconds
         let classification = AXInsert.classify(targetPid: item.targetPid, text: item.text)
+        AXInsert.tick("classify", since: tc)
         switch classification.boundary {
         case .blockedSecure:
             finish(item, status: "blocked-secure")
@@ -114,7 +128,12 @@ final class Delivery: @unchecked Sendable {
             return
         }
 
-        switch AXInsert.insert(payload, targetPid: item.targetPid) {
+        let ti = DispatchTime.now().uptimeNanoseconds
+        let axResult = AXInsert.insert(payload, targetPid: item.targetPid)
+        if let at = AXInsert.writtenAt, axResult == .insertedVerified || axResult == .submittedUnverified { onVisible?(item.session, at) }
+        AXInsert.tick("insert", since: ti)
+        log("ax: " + ["classify", "web", "insert", "read", "set", "verify"].compactMap { k in AXInsert.timing[k].map { "\(k) \($0)" } }.joined(separator: " · "))
+        switch axResult {
         case .insertedVerified:
             finish(item, status: "inserted-verified")
         case .submittedUnverified:
@@ -129,10 +148,26 @@ final class Delivery: @unchecked Sendable {
         }
     }
 
+    private let verifyQueue = DispatchQueue(label: "com.sageathor.rhemion.app.paste-verify", qos: .utility)
+
     private func paste(_ payload: String, item: Item) {
-        ClipboardPaste.paste(payload, targetPid: item.targetPid) { [weak self, item] status in
+        let verifier = PasteVerifier.before()   // observe-only for now: logged, does not change the status
+        let session = item.session
+        var stillTarget: (@Sendable () -> Bool)? = nil
+        if item.checkTarget, let recheck = targetRecheck { stillTarget = { recheck(session) } }
+        ClipboardPaste.paste(payload, targetPid: item.targetPid, stillTarget: stillTarget) { [weak self, item] status in
             guard let self else { return }
+            let token = ClipboardPaste.lastPostedToken.value
+            if case .pasteSubmitted = status { self.onVisible?(item.session, DispatchTime.now().uptimeNanoseconds) }
             self.queue.async { self.finish(item, status: Self.statusString(status)) }
+            guard case .pasteSubmitted = status else { return }
+            self.verifyQueue.async {
+                let outcome = verifier?.after(inserted: payload.utf16.count) ?? .unreadable
+                // Seen in the field: the app has read the clipboard, the user's own goes back now (else the
+                // fallback restore, ClipboardPaste.fallbackRestoreMS).
+                if case .landed = outcome, let token { ClipboardPaste.restoreNow(token: token) }
+                log("verify: paste \(outcome.label)\(verifier.map { " (\($0.label))" } ?? "")")
+            }
         }
     }
 
@@ -154,7 +189,7 @@ final class Delivery: @unchecked Sendable {
         // original) rides along when present so undo-replace can also revert it.
         if status == "inserted-verified" || status == "paste-submitted",
            let n = item.undoN, let pid = item.targetPid {
-            onArmUndo?(n, pid, item.undoRaw)
+            onArmUndo?(n, pid, item.undoRaw, item.session)
         }
         item.onResult(status)
         item.sendAck(item.session, status)

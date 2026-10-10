@@ -268,11 +268,12 @@ extension WindowButtonRow where Leading == EmptyView {
     }
 }
 
-/// Every standard window opens in the true middle of the screen under the pointer, after its SwiftUI
-/// content has settled the size (NSWindow.center() sits deliberately above the middle).
+/// Every window opens in the true middle of the screen under the pointer, after its SwiftUI content has
+/// settled the size (NSWindow.center() sits deliberately above the middle). `fitContent: false` for a resizable
+/// window that keeps its own size (the hub): it is only placed.
 @MainActor
-func centerOnPointerScreen(_ window: NSWindow) {
-    if let view = window.contentViewController?.view {
+func centerOnPointerScreen(_ window: NSWindow, fitContent: Bool = true) {
+    if fitContent, let view = window.contentViewController?.view {
         view.layoutSubtreeIfNeeded()
         let fit = view.fittingSize
         if fit.width > 0, fit.height > 0 { window.setContentSize(fit) }

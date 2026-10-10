@@ -7,6 +7,12 @@ import ApplicationServices
 import Foundation
 
 enum AXInsert {
+    /// Per-phase timings of the last classify + insert, for the `ax:` log line (Delivery queue only).
+    nonisolated(unsafe) static var timing: [String: Int] = [:]
+    /// When the last AX write returned successfully (uptime ns): the text is in the field from here on.
+    nonisolated(unsafe) static var writtenAt: UInt64?
+    static func tick(_ key: String, since t0: UInt64) { timing[key] = Int((DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000) }
+
     enum Boundary: Sendable {
         case noSpace, needsSpace, blockedSecure, targetChanged, unknown
     }
@@ -43,8 +49,12 @@ enum AXInsert {
         ) == .success, settable.boolValue else { return .unsupported }
         guard let range0 = selectedRange(element) else { return .unsupported }
 
+        let tr = DispatchTime.now().uptimeNanoseconds
         let value0 = stringAttribute(element, kAXValueAttribute)
         let length0 = value0?.utf16.count
+        let count0 = numberOfCharacters(element)
+        tick("read", since: tr)
+        let ts = DispatchTime.now().uptimeNanoseconds
 
         // Set before making the call: even an error return can mean the target accepted the edit.
         let wrote = true
@@ -55,7 +65,22 @@ enum AXInsert {
             return wrote ? .submittedUnverified : .unsupported
         }
 
-        usleep(15_000)
+        tick("set", since: ts)
+        writtenAt = DispatchTime.now().uptimeNanoseconds
+        let tv = DispatchTime.now().uptimeNanoseconds
+        defer { tick("verify", since: tv) }
+        // Fast confirmation (3.1): poll the cheap length + caret every 2 ms instead of a fixed 15 ms wait; the
+        // moment both show this text in place, it landed. Otherwise fall through to the full-value check.
+        let grow = text.utf16.count - range0.length, caret = range0.location + text.utf16.count
+        if let count0 {
+            for _ in 0..<20 {
+                usleep(2_000)
+                if let c = numberOfCharacters(element), c - count0 == grow,
+                   let r = selectedRange(element), r.location == caret, r.length == 0 { return .insertedVerified }
+            }
+        } else {
+            usleep(15_000)
+        }
         let element2 = focusedElement() ?? element
         let value1 = stringAttribute(element2, kAXValueAttribute)
         let range1 = selectedRange(element2)
@@ -63,7 +88,8 @@ enum AXInsert {
         if let value1, let length0 {
             let grew = value1.utf16.count - length0
             let present = Data(value1.utf8).range(of: Data(text.utf8)) != nil
-            if present && grew == text.utf16.count { return .insertedVerified }
+            // Replacing a selection grows the value by the text minus what it replaced.
+            if present && grew == text.utf16.count - range0.length { return .insertedVerified }
             if !present && grew == 0 {
                 // Only byte-for-byte unchanged proves the setter did nothing. Equal-length
                 // replacement, normalization, and smart punctuation are possibly-posted writes.
@@ -95,7 +121,9 @@ enum AXInsert {
             return Classification(boundary: .blockedSecure, isWeb: false)
         }
 
+        let tw = DispatchTime.now().uptimeNanoseconds
         let web = hasWebAreaAncestor(element)
+        tick("web", since: tw)
         switch characterLeftOfCaret(element) {
         case .readable(let left):
             // With no incoming text, expose whether the left edge itself abuts a word. The delivery
@@ -205,6 +233,12 @@ enum AXInsert {
             return nil
         }
         return value as? String
+    }
+
+    private static func numberOfCharacters(_ element: AXUIElement) -> Int? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &value) == .success else { return nil }
+        return (value as? NSNumber)?.intValue
     }
 
     private static func selectedRange(_ element: AXUIElement) -> CFRange? {

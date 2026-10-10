@@ -56,6 +56,7 @@ struct HubSettingsPane: View {
             Divider().overlay(RhemionStyle.line(dark))
             Form { sections }
                 .formStyle(.grouped)
+                .contentMargins(.bottom, 24, for: .scrollContent)   // the last footer keeps air above the window edge
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         // Settings is Equatable, so this fires once per edit; the app persists + live-applies it.
@@ -68,22 +69,31 @@ struct HubSettingsPane: View {
         }
     }
 
-    // A group title in the mockup's weight (bold, sentence case — not the default small-caps header).
+    // A group title (bold, sentence case — not the default small-caps header).
     private func groupHeader(_ title: String) -> some View {
         Text(title).font(RhemionStyle.font(13, .bold)).foregroundStyle(RhemionStyle.text(dark)).textCase(nil)
     }
 
     // The footer under a section's card: an optional caption plus the dirty-only "Restore defaults" link
     // (a gold text link with the rotate icon, shown only when the category differs from its defaults).
-    @ViewBuilder private func sectionFooter(_ caption: String? = nil) -> some View {
+    /// `restore: false` for a group that is not the last of its category: Restore defaults belongs once, at the end.
+    /// `link`: a gold text link continuing the caption on its line (e.g. "… is in Recording ›").
+    @ViewBuilder private func sectionFooter(_ caption: String? = nil, link: (title: String, action: () -> Void)? = nil,
+                                            restore: Bool = true) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             if let caption {
-                Text(caption).font(RhemionStyle.font(11)).foregroundStyle(RhemionStyle.secondary(dark))
+                HStack(spacing: 4) {
+                    Text(caption).font(RhemionStyle.font(11)).foregroundStyle(RhemionStyle.secondary(dark))
+                    if let link { TextLink(title: link.title, action: link.action) }
+                }
             }
-            if isDirty(model.settingsCategory) {
-                TextLink(title: "Restore defaults", systemImage: "arrow.counterclockwise") { restore(model.settingsCategory) }
+            if restore, isDirty(model.settingsCategory) {
+                TextLink(title: "Restore defaults", systemImage: "arrow.counterclockwise") { self.restore(model.settingsCategory) }
             }
-        }.textCase(nil).padding(.top, 2)
+        }
+        // Always from the card's left edge: a short footer (only Restore defaults) used to sit off to the side.
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .textCase(nil).padding(.top, 2)
     }
 
     // MARK: category sidebar
@@ -132,7 +142,9 @@ struct HubSettingsPane: View {
             SettingRow(title: "Launch at login", description: "Start Rhemion when you sign in.") {
                 Toggle("", isOn: $settings.launchAtLogin).labelsHidden()
             }
-            pttBindings
+            SettingRow(title: "Dictation key", description: "\(dictationKeyNames.joined(separator: " or ")). Hold to dictate; release to insert.") {
+                TextLink(title: "Change in Shortcuts ›") { model.settingsCategory = .shortcuts }
+            }
             SettingRow(title: "Text insertion", description: "Direct types the text; Clipboard pastes it.") {
                 BoxedPicker(selection: $settings.inputMethod,
                             options: AppSettings.inputMethodOptions.map { SettingsChoice(id: $0, label: Self.inputLabel($0)) })
@@ -142,6 +154,19 @@ struct HubSettingsPane: View {
                             options: AppSettings.languageOptions.map { SettingsChoice(id: $0, label: Self.languageLabel($0)) })
             }
         } header: { groupHeader("Startup & input") }
+        Section {
+            SettingRow(title: "When dictation starts", description: "With a window pinned (⌥⌘P or the menu-bar menu): stay in it, or put the text there and come back.") {
+                BoxedPicker(selection: $settings.pinMode, options: [SettingsChoice(id: "stay", label: "Go to the pinned window"), SettingsChoice(id: "return", label: "Insert there, come back")])
+            }
+            SettingRow(title: "Unpin automatically", description: "Release the pin after a while, even if you don't.") {
+                Toggle("", isOn: $settings.pinAutoUnpin).labelsHidden()
+            }
+            if settings.pinAutoUnpin {
+                SettingRow(title: "Unpin after", description: "Counted from the moment you pinned.") {
+                    StepperBox(value: $settings.pinAutoUnpinMinutes, range: 5...480, step: 5) { "\($0) min" }
+                }
+            }
+        } header: { groupHeader("Pinned window") }
         Section {
             SettingRow(title: "Theme", description: "Light, dark, or follow the system.") {
                 ThemeSegmented(selection: $settings.theme)
@@ -153,20 +178,63 @@ struct HubSettingsPane: View {
         } header: { groupHeader("Appearance") } footer: { sectionFooter() }
     }
 
-    private var shortcutsSection: some View {
+    /// Shortcuts (3.1): every keyboard
+    /// action, in the order you meet it in a dictation. Gestures follow the dictation key, cannot be re-recorded and
+    /// switch on or off; chords are recorded. A single key is written as its name, chords as symbols (DESIGN.md).
+    @ViewBuilder private var shortcutsSection: some View {
         Section {
-            hotkeyBindings("Recall", "Re-insert your last dictation.", $settings.recallHotkeys)
-            hotkeyBindings("Dictionary add", "Add the selection as a replacement.", $settings.dictAddHotkeys)
-            hotkeyBindings("Undo replacement", "Revert the last dictionary replacement.", $settings.undoHotkeys)
-        } header: { groupHeader("Shortcuts") } footer: { sectionFooter() }
+            pttBindings
+            gestureRow("Hands-free", "Double-tap to keep recording. Tap again to stop; long silence stops it too.",
+                       groups: dictationKeyNames.map { [$0] }, suffix: "twice", isOn: $settings.handsFreeEnabled)
+            gestureRow("Cancel", settings.keepCanceled
+                       ? "Throw the recording away. Nothing is inserted; it waits in the Journal for \(settings.keepCanceledHours) h."
+                       : "Throw the recording away. Nothing is inserted or kept.",
+                       groups: [["Esc"]], suffix: "twice", isOn: $settings.escCancelEnabled)
+            if let mod = HotkeyTap.journalModifier(for: settings.pttKeys) {
+                gestureRow("Journal only", "Save the text to the Journal; nothing is inserted.",
+                           groups: dictationKeyNames.map { [mod.name, $0] }, suffix: nil, isOn: $settings.journalOnlyEnabled)
+            }
+        } header: { groupHeader("While you speak") } footer: { sectionFooter(restore: false) }
+        Section {
+            gestureRow("Erase", "Remove the text just inserted, within \(settings.undoTTLSecs) s.",
+                       groups: [["Esc"]], suffix: "twice", isOn: $settings.escEraseEnabled)
+            hotkeyBindings("Undo replacement", "Put back what you said before the dictionary changed it.", $settings.undoHotkeys)
+        } header: { groupHeader("Right after") } footer: { sectionFooter(restore: false) }
+        Section {
+            hotkeyBindings("Recall", "Insert your last dictation again, even one you canceled or erased.", $settings.recallHotkeys)
+            hotkeyBindings("Pin to this window", "Send every dictation to the window you are in; again to unpin.", $settings.pinHotkeys)
+            hotkeyBindings("Add to dictionary", "Teach Rhemion the selected word.", $settings.dictAddHotkeys)
+        } header: { groupHeader("Anytime") } footer: { sectionFooter(restore: false) }
+        Section {
+            SettingRow(title: "Leave double Esc to", description: "In these apps Esc twice goes to the app, never to Rhemion.", field: true) {
+                AppBindingStack(bundleIDs: $settings.escExceptionApps)
+            }
+        } header: { groupHeader("Exceptions") } footer: {
+            sectionFooter("Timing for hands-free and double Esc is in", link: ("Recording ›", { model.settingsCategory = .recording }))
+        }
+    }
+
+    /// The dictation keys by name, as on a key cap ("Right Command", "Fn"): one key is written as its name.
+    private var dictationKeyNames: [String] {
+        settings.pttKeys.map { Self.pttLabel($0).replacingOccurrences(of: " (Globe)", with: "") }
+    }
+
+    /// A gesture: its keys on the row (no field border: not editable), and its switch.
+    private func gestureRow(_ title: String, _ description: String, groups: [[String]], suffix: String?, isOn: Binding<Bool>) -> some View {
+        SettingRow(title: title, description: description) {
+            HStack(spacing: 10) {
+                GestureKeys(groups: groups, suffix: suffix, dark: dark)
+                Toggle("", isOn: isOn).labelsHidden()
+            }
+        }
     }
 
     // MARK: multi-binding editors (the recorder — × inside the field, square "+" on the last
     // row; PTT is a stack of boxed pickers with the same add/remove model).
 
-    // Push-to-talk — one or more device modifiers; any of them starts dictation.
+    // The dictation key — one or more device modifiers; any of them starts dictation.
     private var pttBindings: some View {
-        SettingRow(title: "Push-to-talk key", description: "Hold to dictate; release to insert.", field: true) {
+        SettingRow(title: "Dictation key", description: "Hold to dictate; release to insert.", field: true) {
             PTTBindingStack(keys: $settings.pttKeys, label: Self.pttLabel)
         }
     }
@@ -262,6 +330,18 @@ struct HubSettingsPane: View {
         .onAppear { refreshExportOwned() }
         .onChange(of: settings.exportDir) { _, _ in refreshExportOwned() }
         Section {
+            SettingRow(title: "Keep canceled dictations", description: "A recording you cancel with Esc twice stays in the Journal, so a cancel by mistake can be brought back.") {
+                Toggle("", isOn: $settings.keepCanceled).labelsHidden()
+            }
+            if settings.keepCanceled {
+                SettingRow(title: "Keep them for", description: "Canceled entries are deleted after this; ordinary entries follow Cleanup.") {
+                    StepperBox(value: $settings.keepCanceledHours, range: 1...168) { "\($0) h" }
+                }
+            }
+        } header: { groupHeader("Canceled dictations") } footer: {
+            sectionFooter("Recordings shorter than a second are never kept. Audio and text stay on this Mac, like every Journal entry.", restore: false)
+        }
+        Section {
             retentionRow("Keep local audio", "Delete recordings older than this.", value: $settings.audioRetentionValue, unit: $settings.audioRetentionUnit)
             retentionRow("Keep transcripts", "Delete entries older than this.", value: $settings.transcriptRetentionValue, unit: $settings.transcriptRetentionUnit)
         } header: { groupHeader("Cleanup") } footer: {
@@ -275,12 +355,16 @@ struct HubSettingsPane: View {
         let d = AppSettings()
         switch category {
         case .general:
-            return settings.launchAtLogin != d.launchAtLogin || settings.pttKeys != d.pttKeys
+            return settings.launchAtLogin != d.launchAtLogin
                 || settings.inputMethod != d.inputMethod || settings.language != d.language
                 || settings.theme != d.theme || settings.indicatorStyle != d.indicatorStyle
+                || settings.pinMode != d.pinMode || settings.pinAutoUnpin != d.pinAutoUnpin || settings.pinAutoUnpinMinutes != d.pinAutoUnpinMinutes
         case .shortcuts:
-            return settings.recallHotkeys != d.recallHotkeys || settings.dictAddHotkeys != d.dictAddHotkeys
-                || settings.undoHotkeys != d.undoHotkeys
+            return settings.recallHotkeys != d.recallHotkeys || settings.dictAddHotkeys != d.dictAddHotkeys || settings.pinHotkeys != d.pinHotkeys
+                || settings.undoHotkeys != d.undoHotkeys || settings.pttKeys != d.pttKeys
+                || settings.handsFreeEnabled != d.handsFreeEnabled || settings.escCancelEnabled != d.escCancelEnabled
+                || settings.escEraseEnabled != d.escEraseEnabled || settings.journalOnlyEnabled != d.journalOnlyEnabled
+                || settings.escExceptionApps != d.escExceptionApps
         case .audio:
             return settings.model != d.model || settings.audioMicrophone != d.audioMicrophone
                 || settings.whisperBinary != d.whisperBinary || settings.modelDirs != d.modelDirs
@@ -293,6 +377,7 @@ struct HubSettingsPane: View {
                 || settings.exportSchedule != d.exportSchedule || settings.exportDir != d.exportDir
                 || settings.audioRetentionValue != d.audioRetentionValue || settings.audioRetentionUnit != d.audioRetentionUnit
                 || settings.transcriptRetentionValue != d.transcriptRetentionValue || settings.transcriptRetentionUnit != d.transcriptRetentionUnit
+                || settings.keepCanceled != d.keepCanceled || settings.keepCanceledHours != d.keepCanceledHours
         case .advanced:
             return false   // Diagnostics + Storage: nothing to restore
         }
@@ -302,12 +387,16 @@ struct HubSettingsPane: View {
         let d = AppSettings()
         switch category {
         case .general:
-            settings.launchAtLogin = d.launchAtLogin; settings.pttKeys = d.pttKeys
+            settings.launchAtLogin = d.launchAtLogin
             settings.inputMethod = d.inputMethod; settings.language = d.language; settings.theme = d.theme
             settings.indicatorStyle = d.indicatorStyle
+            settings.pinMode = d.pinMode; settings.pinAutoUnpin = d.pinAutoUnpin; settings.pinAutoUnpinMinutes = d.pinAutoUnpinMinutes
         case .shortcuts:
-            settings.recallHotkeys = d.recallHotkeys; settings.dictAddHotkeys = d.dictAddHotkeys
-            settings.undoHotkeys = d.undoHotkeys
+            settings.recallHotkeys = d.recallHotkeys; settings.dictAddHotkeys = d.dictAddHotkeys; settings.pinHotkeys = d.pinHotkeys
+            settings.undoHotkeys = d.undoHotkeys; settings.pttKeys = d.pttKeys
+            settings.handsFreeEnabled = d.handsFreeEnabled; settings.escCancelEnabled = d.escCancelEnabled
+            settings.escEraseEnabled = d.escEraseEnabled; settings.journalOnlyEnabled = d.journalOnlyEnabled
+            settings.escExceptionApps = d.escExceptionApps
         case .audio:
             settings.model = d.model; settings.audioMicrophone = d.audioMicrophone
             settings.whisperBinary = d.whisperBinary; settings.modelDirs = d.modelDirs
@@ -320,6 +409,7 @@ struct HubSettingsPane: View {
             settings.exportSchedule = d.exportSchedule; settings.exportDir = d.exportDir; settings.exportInitialized = false
             settings.audioRetentionValue = d.audioRetentionValue; settings.audioRetentionUnit = d.audioRetentionUnit
             settings.transcriptRetentionValue = d.transcriptRetentionValue; settings.transcriptRetentionUnit = d.transcriptRetentionUnit
+            settings.keepCanceled = d.keepCanceled; settings.keepCanceledHours = d.keepCanceledHours
         case .advanced:
             break
         }
@@ -515,7 +605,7 @@ let hubStackField: CGFloat = hubFieldColumn - hubStackGap - hubPlus
 let hubFieldHeight: CGFloat = 30
 
 /// A settings row: title + one-line description on the left, a trailing control on the right (matches
-/// the mockup's inset-grouped rows).
+/// the inset-grouped rows).
 /// - `field`: the control sits in THE field column (`hubFieldColumn`, path + shortcut fields).
 /// - `wide`: the control fills the available row width (the speech-model row, the log button).
 /// - otherwise it sits in the compact `hubZone`-wide trailing zone, right-aligned.
@@ -549,7 +639,7 @@ private struct SettingRow<Control: View>: View {
     }
 }
 
-/// A boxed pop-up (native menu on open; boxed value + a single up/down chevron closed) — the mockup's
+/// A boxed pop-up (native menu on open; boxed value + a single up/down chevron closed) — the settings
 /// picker. The box lives on the outer HStack (a menu label's own background is ignored under the
 /// borderless style), and the native menu indicator is hidden so only our chevron shows.
 private struct BoxedPicker: View {
@@ -629,7 +719,7 @@ private struct ThemeSegmented: View {
     }
 }
 
-/// A bordered "− value +" stepper box (the mockup's stepper) — the value + unit sits between the two
+/// A bordered "− value +" stepper box — the value + unit sits between the two
 /// segment buttons, clamped to `range`.
 private struct StepperBox: View {
     @Binding var value: Int
@@ -946,6 +1036,104 @@ private struct PathField: View {
 /// A stack of folder fields (Model folders). Same add/remove model as the hotkey stack: a lone empty
 /// field is clickable to choose; × clears it (lone) or removes the row (several); the square "+" adds
 /// another. Edited as a local list and mirrored to the caller (empty rows dropped on persist).
+/// A gesture's keys (3.1): caps on the row surface, no field around them (a gesture is not editable). Groups are
+/// alternatives joined by "or"; keys inside a group are pressed together; "twice" once at the end. From three
+/// alternatives on, one line "Dictation key" and a tooltip listing them.
+private struct GestureKeys: View {
+    let groups: [[String]]
+    let suffix: String?
+    let dark: Bool
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if groups.count >= 3 {
+                Text("Dictation key").font(RhemionStyle.font(11, .semibold)).foregroundStyle(RhemionStyle.text(dark))
+                    .help(groups.map { $0.joined(separator: " + ") }.joined(separator: ", "))
+            } else {
+                ForEach(groups.indices, id: \.self) { g in
+                    if g > 0 { word("or") }
+                    ForEach(groups[g].indices, id: \.self) { k in cap(groups[g][k]) }
+                }
+            }
+            if let suffix { word(suffix) }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel((groups.count >= 3 ? "Dictation key" : groups.map { $0.joined(separator: " and ") }.joined(separator: " or "))
+                            + (suffix.map { " \($0)" } ?? ""))
+    }
+
+    private func cap(_ name: String) -> some View {
+        Text(name).font(RhemionStyle.font(11, .semibold)).foregroundStyle(RhemionStyle.text(dark))
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(RhemionStyle.hover(dark), in: RoundedRectangle(cornerRadius: 5))
+            .overlay { RoundedRectangle(cornerRadius: 5).strokeBorder(RhemionStyle.line(dark), lineWidth: 1) }
+    }
+    private func word(_ text: String) -> some View {
+        Text(text).font(RhemionStyle.font(11)).foregroundStyle(RhemionStyle.tertiary(dark))
+    }
+}
+
+/// Apps by bundle ID (3.1 double-Esc exceptions): a field per app with its icon and name, × removes, + picks an app.
+private struct AppBindingStack: View {
+    @Binding var bundleIDs: [String]
+    @Environment(\.colorScheme) private var scheme
+    private var dark: Bool { scheme == .dark }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: hubStackGap) {
+            if bundleIDs.isEmpty {
+                HStack(spacing: hubStackGap) {
+                    field(nil).frame(width: hubStackField)
+                    HubSquareAdd(dark: dark, active: true) { choose() }
+                }
+            }
+            ForEach(bundleIDs.indices, id: \.self) { i in
+                HStack(spacing: hubStackGap) {
+                    field(bundleIDs[i]).frame(width: hubStackField)
+                    if i == bundleIDs.count - 1 { HubSquareAdd(dark: dark, active: bundleIDs.count < 12) { choose() } }
+                }
+            }
+        }
+    }
+
+    private func field(_ id: String?) -> some View {
+        let url = id.flatMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) }
+        let name = url.map { FileManager.default.displayName(atPath: $0.path).replacingOccurrences(of: ".app", with: "") } ?? id
+        return HStack(spacing: 8) {
+            if let url {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: url.path)).resizable().frame(width: 16, height: 16)
+            }
+            Text(name ?? "Choose app…").font(RhemionStyle.font(12))
+                .foregroundStyle(name == nil ? RhemionStyle.tertiary(dark) : RhemionStyle.text(dark)).lineLimit(1)
+            Spacer(minLength: 0)
+            if let id {
+                Button { bundleIDs.removeAll { $0 == id } } label: {
+                    Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(RhemionStyle.tertiary(dark)).frame(width: 18, height: 18).contentShape(Circle())
+                }.buttonStyle(.plain).help("Remove")
+            }
+        }
+        .padding(.horizontal, 10).frame(maxWidth: .infinity).frame(height: hubFieldHeight)
+        .contentShape(Rectangle())
+        .onTapGesture { if id == nil { choose() } }
+        .background(RhemionStyle.win(dark), in: RoundedRectangle(cornerRadius: 7))
+        .overlay { RoundedRectangle(cornerRadius: 7).strokeBorder(RhemionStyle.line(dark), lineWidth: 1) }
+    }
+
+    private func choose() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add"
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            if let id = Bundle(url: url)?.bundleIdentifier, !bundleIDs.contains(id) { bundleIDs.append(id) }
+        }
+    }
+}
+
 private struct PathBindingStack: View {
     let placeholder: String
     let onChange: ([String]) -> Void

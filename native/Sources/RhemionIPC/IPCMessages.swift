@@ -11,12 +11,21 @@ public enum Command: Equatable, Sendable {
     /// runtime echoes it back in the matching `.deliver` event. `nil` when the client omits it or
     /// sends a non-integer value (back-compat / no frontmost app).
     case start(pressedAt: Double?, targetPid: Int?)
+    /// 3.1 "Journal only" (the dictation key pressed with Shift): a take like `.start`, but its text is never
+    /// delivered: it goes to the journal only (not delivered, error `journal-only`) and the runtime answers with
+    /// `.journaled` instead of `.deliver`. Wire form: `{"cmd":"start","journal":true}`.
+    case startJournal(pressedAt: Double?, targetPid: Int?)
     case stop
     /// Abort the active take WITHOUT delivering: the runtime stops capture, discards the partial
     /// audio (no transcription), writes no history row, and emits `.canceled`. Unlike `.stop`, the
     /// take never becomes "the last dictation" — so a canceled recording can't leak into recall or
     /// be re-inserted. Sent by the client's double-Esc gesture while a recording is in progress.
     case cancel
+    /// 3.1: abort the active take like `.cancel` (`.canceled` at once, nothing delivered), but KEEP it: a take of
+    /// at least a second is recognised quietly and written to history as not delivered with the error
+    /// `canceled`, so the Journal shows it as Canceled and Recall can bring it back. Wire form:
+    /// `{"cmd":"cancel","keep":true}` (an older runtime reads it as a plain cancel).
+    case cancelKeeping
     /// Exact history IDs; an additive command used by the journal only.
     case historyDelete(ids: [String])
     case exportNow
@@ -34,6 +43,9 @@ public enum Command: Equatable, Sendable {
     case listDevices
     case downloadModel(id: String)
     case cancelModelDownload
+    /// 3.1: recognise a journal entry's kept recording again (a take whose recognition failed). Answered by one
+    /// `.rerecognized` for the same id; the entry's text is rewritten in the journal when it succeeds.
+    case rerecognize(id: String)
 }
 
 /// A recognition model the picker can offer — the display subset of RhemionASR's ModelEntry, carried
@@ -81,6 +93,8 @@ public enum Event: Equatable, Sendable {
     /// The take produced nothing to deliver (dropped by the audio gate as an empty/silent tap, or
     /// post-processing emptied it). Lets the indicator retract without ever showing a spinner.
     case canceled(session: String)
+    /// 3.1: a Journal-only take was recognised and saved to the journal (nothing is inserted anywhere).
+    case journaled(session: String)
     /// One terminal response across all months, including empty/partial results.
     case historyDeleted(ids: [String], removedIDs: [String], error: String?)
     /// `skipped`: month notes NOT written because a same-named file exists that Rhemion didn't write
@@ -93,6 +107,9 @@ public enum Event: Equatable, Sendable {
     /// The runtime's answer to `.listDevices`: the models and microphones it currently sees.
     case devices(models: [ModelOption], mics: [MicOption])
     case modelDownload(id: String, state: String, fraction: Double?, error: String?)
+    /// The answer to `.rerecognize`: `ok` when the entry now has text; otherwise `error` says why (no speech in
+    /// the recording, the recording or the entry is gone, recognition failed again).
+    case rerecognized(id: String, ok: Bool, error: String?)
 }
 
 public enum IPCError: Error {
