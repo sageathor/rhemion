@@ -59,18 +59,24 @@ enum HotkeySpec {
         return (mods + [key]).joined(separator: "+")
     }
 
-    /// The chord as ORDERED display caps, e.g. "cmd+option+r" -> ["⌘","⌥","R"]. Disabled -> [] (so the
+    /// The chord as ORDERED display caps in macOS order, e.g. "cmd+option+r" -> ["⌥","⌘","R"]. Disabled -> [] (so the
     /// recorder field shows its placeholder). Used to render each key as its own cap chip.
     static func caps(_ spec: String) -> [String] {
         guard !isDisabled(spec) else { return [] }
         let parts = spec.lowercased().replacingOccurrences(of: " ", with: "").split(separator: "+").map(String.init)
         guard let last = parts.last else { return [] }
-        return parts.dropLast().map { symbol($0) } + [last.uppercased()]
+        return displayOrdered(parts.dropLast().map { symbol($0) }) + [last.uppercased()]
     }
 
     /// The modifier symbols currently held, in canonical order — for the live preview while recording.
     static func modifierCaps(_ flags: NSEvent.ModifierFlags) -> [String] {
-        orderedModifiers.filter { flags.contains($0.flag) }.map { symbol($0.token) }
+        displayOrdered(orderedModifiers.filter { flags.contains($0.flag) }.map { symbol($0.token) })
+    }
+
+    /// macOS display order of modifiers: ⌃ ⌥ ⇧ ⌘ (as in menus), whatever order the spec stores them in.
+    private static let displayRank: [String: Int] = ["⌃": 0, "⌥": 1, "⇧": 2, "⌘": 3]
+    private static func displayOrdered(_ symbols: [String]) -> [String] {
+        symbols.sorted { (displayRank[$0] ?? 9) < (displayRank[$1] ?? 9) }
     }
 
     private static func symbol(_ token: String) -> String {
@@ -78,14 +84,26 @@ enum HotkeySpec {
          "ctrl": "⌃", "control": "⌃", "shift": "⇧"][token] ?? token.uppercased()
     }
 
-    /// Pretty form for the UI, e.g. "cmd+option+r" -> "⌘⌥R". Disabled -> "None".
+    /// The first enabled chord of `specs` as a menu key equivalent (key + modifier mask), so a menu item shows the
+    /// chord actually bound. Nil when every chord is off.
+    static func menuEquivalent(_ specs: [String]) -> (key: String, modifiers: NSEvent.ModifierFlags)? {
+        for spec in specs where !isDisabled(spec) {
+            let parts = spec.lowercased().replacingOccurrences(of: " ", with: "").split(separator: "+").map(String.init)
+            guard let key = parts.last, keyCodeByName[key] != nil else { continue }
+            let mods = parts.dropLast().reduce(into: NSEvent.ModifierFlags()) { $0.formUnion(modifierAliases[$1] ?? []) }
+            return (key, mods)
+        }
+        return nil
+    }
+
+    /// Pretty form for the UI, e.g. "cmd+option+r" -> "⌥⌘R". Disabled -> "None".
     static func display(_ spec: String) -> String {
         guard !isDisabled(spec) else { return "None" }
         let symbols: [String: String] = ["cmd": "⌘", "command": "⌘", "opt": "⌥", "option": "⌥",
                                          "alt": "⌥", "ctrl": "⌃", "control": "⌃", "shift": "⇧"]
         let parts = spec.lowercased().replacingOccurrences(of: " ", with: "").split(separator: "+").map(String.init)
         guard let last = parts.last else { return "None" }
-        let prefix = parts.dropLast().map { symbols[$0] ?? $0 }.joined()
+        let prefix = displayOrdered(parts.dropLast().map { symbols[$0] ?? $0 }).joined()
         return prefix + last.uppercased()
     }
 }

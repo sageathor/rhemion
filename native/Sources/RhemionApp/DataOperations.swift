@@ -36,6 +36,7 @@ final class DataOperations: ObservableObject {
         inProgress = true
         app.hotkey?.abortRecording()          // no onStop fires; nothing gets inserted for this take
         app.clearRecordingFlag()              // abortRecording() alone leaves isDictatingNow stuck true
+        app.userCanceled.value = true
         app.client?.send(.cancel)             // tell the runtime (if still up) to discard the take too
         if case .downloading = app.modelDownload.phase {
             app.client?.send(.cancelModelDownload)

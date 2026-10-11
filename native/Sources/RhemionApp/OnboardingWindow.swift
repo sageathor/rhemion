@@ -48,7 +48,7 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
             let root = OnboardingView(permissions: permissions,
                                       modelDownload: modelDownload,
                                       logoClock: logoClock,
-                                      initialPTTKey: current().pttKeys.first ?? "right_option",
+                                      initialPTTKey: current().pttKeys.first ?? AppSettings().pttKeys.first ?? "right_cmd",
                                       initialLaunchAtLogin: current().launchAtLogin,
                                       setPTTKey: setPTTKey,
                                       setLaunchAtLogin: setLaunchAtLogin,
@@ -281,19 +281,11 @@ struct OnboardingView: View {
     }
 
     /// Launch-at-login, surfaced on Welcome (default on, but visible — we ask, we don't silently register).
-    /// A checkbox beside the action button, styled like the Journal selection checkbox: gold fill + white check.
+    /// A checkbox beside the action button: the shared `JournalCheckbox`.
     private var launchCheckbox: some View {
         Button { launchAtLogin.toggle(); setLaunchAtLogin(launchAtLogin) } label: {
             HStack(spacing: 8) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 3.5).fill(launchAtLogin ? RhemionStyle.gold : .clear)
-                    RoundedRectangle(cornerRadius: 3.5)
-                        .strokeBorder(launchAtLogin ? RhemionStyle.gold : (dark ? Color.white.opacity(0.28) : Color.black.opacity(0.24)), lineWidth: 1)
-                    if launchAtLogin {
-                        Image(systemName: "checkmark").font(.system(size: 9, weight: .bold)).foregroundStyle(.white)
-                    }
-                }
-                .frame(width: 15, height: 15)
+                JournalCheckbox(on: launchAtLogin).accessibilityHidden(true)
                 Text("Start Rhemion at login").font(RhemionStyle.font(12.5, .semibold)).fixedSize()
             }
             .contentShape(Rectangle())
@@ -359,7 +351,7 @@ struct OnboardingView: View {
             Image(systemName: ready ? "checkmark.circle.fill" : "circle").font(.system(size: 10, weight: .semibold))
             Text(ready ? "Ready — On-device" : "Required for dictation").font(RhemionStyle.font(10, .semibold))
         }
-        .foregroundStyle(ready ? Color(rhemionHex: 0x2E9E5B) : RhemionStyle.tertiary(dark))
+        .foregroundStyle(ready ? RhemionStyle.success : RhemionStyle.tertiary(dark))
     }
 
     private func permissionRow(icon: String, title: String, detail: String, granted: Bool, action: @escaping () -> Void) -> some View {
@@ -394,10 +386,10 @@ struct OnboardingView: View {
         HStack(spacing: 4) {
             Image(systemName: granted ? "checkmark.circle.fill" : "circle")
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(granted ? Color(rhemionHex: 0x2E9E5B) : RhemionStyle.tertiary(dark))
+                .foregroundStyle(granted ? RhemionStyle.success : RhemionStyle.tertiary(dark))
             Text(granted ? "Granted" : "Not granted")
                 .font(RhemionStyle.font(10, .semibold))
-                .foregroundStyle(granted ? Color(rhemionHex: 0x2E9E5B) : RhemionStyle.tertiary(dark))
+                .foregroundStyle(granted ? RhemionStyle.success : RhemionStyle.tertiary(dark))
         }
     }
 
@@ -444,6 +436,7 @@ struct OnboardingView: View {
         }
         .padding(2)
         .background(RhemionStyle.hover(dark), in: RoundedRectangle(cornerRadius: 8))
+        .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(RhemionStyle.line(dark), lineWidth: 0.5) }
     }
 
     private func cardTitle(_ text: String) -> some View {

@@ -20,6 +20,7 @@ extension AppController {
             recordingFlag.value = false
             hotkey?.abortRecording()   // so the eventual PTT release doesn't send a stray .stop
             // Kept (3.1, default on): the runtime journals it as Canceled for Recall / Insert again; else discarded.
+            userCanceled.value = true
             client?.send(settings.keepCanceled ? .cancelKeeping : .cancel)
             indicator?.hide()
             return true

@@ -26,7 +26,7 @@ Where to change them:
 
 ## Recording indicator
 
-While Rhemion listens, an amber indicator appears at the notch, or as a small pill below the menu bar on Macs without a notch. It grows with your voice, sends out calm waves while the text is recognized, and shows how the dictation ended: the waves go out when the text is in, a ring holds when it is kept in the Journal, the orb empties in red when nothing was recognized. It also shows a countdown ring before hands-free recording stops on its own. Settings › General › Recording indicator: Auto, Notch or Floating.
+While Rhemion listens, an amber indicator appears at the notch, or as a small pill below the menu bar on Macs without a notch. It grows with your voice, sends out calm waves while the text is recognized, and shows how the dictation ended: the waves go out when the text is in, a ring holds when it is kept in the Journal, the orb empties in red when recognition fails. It also shows a countdown ring before hands-free recording stops on its own. Settings › General › Recording indicator: Auto, Notch or Floating.
 
 ## How text is inserted
 

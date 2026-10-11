@@ -20,7 +20,7 @@ final class DictionaryModel: ObservableObject {
 }
 
 /// The Dictionary pane inside the hub, styled to the shared design system
-/// (`RhemionStyle`): a subtitle + gold "Add replacement" action, a bordered table card (Spoken as → Replace
+/// (`RhemionStyle`): a subtitle + the raised "Add replacement" action, a bordered table card (Spoken as → Replace
 /// with) with in-place editable rows, and the quick-add hint. Edits
 /// persist to active/dictionary.json on change, incomplete rows dropped, runtime hot-reloads.
 struct HubDictionaryPane: View {
@@ -158,7 +158,7 @@ struct HubDictionaryPane: View {
             Text("Add names, technical terms, or phrases you use often.")
             HStack(spacing: 5) {
                 Text("Quick-add from any app with")
-                kbd("⌘"); kbd("⌥"); kbd("W")
+                kbd("⌥"); kbd("⌘"); kbd("W")
             }
         }
         .font(RhemionStyle.font(11)).lineSpacing(3)

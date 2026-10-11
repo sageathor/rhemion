@@ -151,22 +151,27 @@ final class Delivery: @unchecked Sendable {
     private let verifyQueue = DispatchQueue(label: "com.sageathor.rhemion.app.paste-verify", qos: .utility)
 
     private func paste(_ payload: String, item: Item) {
-        let verifier = PasteVerifier.before()   // observe-only for now: logged, does not change the status
+        let verifier = PasteVerifier.before()
         let session = item.session
         var stillTarget: (@Sendable () -> Bool)? = nil
         if item.checkTarget, let recheck = targetRecheck { stillTarget = { recheck(session) } }
         ClipboardPaste.paste(payload, targetPid: item.targetPid, stillTarget: stillTarget) { [weak self, item] status in
             guard let self else { return }
             let token = ClipboardPaste.lastPostedToken.value
-            if case .pasteSubmitted = status { self.onVisible?(item.session, DispatchTime.now().uptimeNanoseconds) }
-            self.queue.async { self.finish(item, status: Self.statusString(status)) }
-            guard case .pasteSubmitted = status else { return }
+            guard case .pasteSubmitted = status else { self.queue.async { self.finish(item, status: Self.statusString(status)) }; return }
+            self.onVisible?(item.session, DispatchTime.now().uptimeNanoseconds)
+            // ⌘V only says the shortcut was sent: the status waits for the field to change (about 50 ms). A miss
+            // (the field stayed as it was, for the whole window or while the focus moved on) is Not inserted.
+            guard let verifier else { log("verify: paste unreadable"); self.queue.async { self.finish(item, status: "paste-submitted") }; return }
             self.verifyQueue.async {
-                let outcome = verifier?.after(inserted: payload.utf16.count) ?? .unreadable
+                let outcome = verifier.after(inserted: payload.utf16.count) { miss in
+                    let status = miss == .elsewhere ? "paste-elsewhere" : miss == .unchanged ? "paste-unchanged" : "paste-submitted"
+                    self.queue.async { self.finish(item, status: status) }
+                }
                 // Seen in the field: the app has read the clipboard, the user's own goes back now (else the
                 // fallback restore, ClipboardPaste.fallbackRestoreMS).
                 if case .landed = outcome, let token { ClipboardPaste.restoreNow(token: token) }
-                log("verify: paste \(outcome.label)\(verifier.map { " (\($0.label))" } ?? "")")
+                log("verify: paste \(outcome.label) (\(verifier.label))")
             }
         }
     }

@@ -499,8 +499,13 @@ struct FarewellView: View {
     private static let checkboxColumn: CGFloat = 18
     private static let checkboxGap: CGFloat = 10
 
+    @StateObject private var focusVisibility = KeyboardFocusVisibility()
+
     var body: some View {
         StandardWindow(width: Self.width) { sideColumn } main: { chooseContent }
+            .environmentObject(focusVisibility)
+            .onAppear { focusVisibility.start() }
+            .onDisappear { focusVisibility.stop() }
             .allowsHitTesting(model.phase == .choose)
             .disabled(model.phase != .choose)   // also no keyboard / VoiceOver press behind the pop-up
             .onExitCommand { if model.phase == .choose { onCancel() } }
@@ -548,7 +553,7 @@ struct FarewellView: View {
                         .font(RhemionStyle.font(11.5, .semibold)).foregroundStyle(RhemionStyle.danger)
                 }
             } buttons: {
-                RaisedButton(title: "Cancel", action: onCancel)
+                RaisedButton(title: "Cancel", action: onCancel).keyboardShortcut(.defaultAction)   // Return never uninstalls
                 RaisedButton(title: "Uninstall", danger: true, action: model.uninstall)
             }
         }
@@ -587,8 +592,11 @@ struct FarewellView: View {
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture(perform: toggle)
-        .accessibilityAddTraits(.isButton)
+        .onTapGesture { if enabled { toggle() } }
+        .modifier(KeyboardToggle(active: enabled, toggle: toggle))
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(model.options[keyPath: key] ? "checked" : "unchecked")
+        .accessibilityAddTraits(.isToggle)
     }
 
     /// The export option: one constant hint (ticked or not) and the folder always under it (with Show in
@@ -673,5 +681,30 @@ struct FarewellPopupView: View {
         case .stuck(let message):
             StuckContent(message: message, dark: dark)
         }
+    }
+}
+
+/// A choice row that keyboard users reach with Tab and toggle with Space, as in Clear Data: no system focus
+/// ring; a gold outline (drawn 6 pt outside the row, so the layout does not move) marks keyboard focus only.
+private struct KeyboardToggle: ViewModifier {
+    let active: Bool
+    let toggle: () -> Void
+    @EnvironmentObject private var focusVisibility: KeyboardFocusVisibility
+    @FocusState private var focused: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .overlay {
+                if focused && focusVisibility.visible {
+                    RoundedRectangle(cornerRadius: 7).strokeBorder(RhemionStyle.gold, lineWidth: 1.75).padding(-6)
+                }
+            }
+            .focusable(active)
+            .focusEffectDisabled()
+            .focused($focused)
+            .onKeyPress(.space) {
+                guard active else { return .ignored }
+                toggle(); return .handled
+            }
     }
 }

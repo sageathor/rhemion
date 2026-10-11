@@ -124,7 +124,7 @@ struct SpeechModelSettingValue: View {
             HStack(spacing: 4) {
                 Image(systemName: "checkmark.circle.fill").font(.system(size: 11, weight: .semibold))
                 Text("Ready — On-device").font(RhemionStyle.font(12, .semibold))
-            }.foregroundStyle(Color(rhemionHex: 0x2E9E5B))
+            }.foregroundStyle(RhemionStyle.success)
         } else {
             SpeechModelStatus(model: model)
         }

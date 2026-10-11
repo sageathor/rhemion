@@ -84,8 +84,10 @@ struct HubSettingsPane: View {
             if let caption {
                 HStack(spacing: 4) {
                     Text(caption).font(RhemionStyle.font(11)).foregroundStyle(RhemionStyle.secondary(dark))
+                        .multilineTextAlignment(.leading)
                     if let link { TextLink(title: link.title, action: link.action) }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             if restore, isDirty(model.settingsCategory) {
                 TextLink(title: "Restore defaults", systemImage: "arrow.counterclockwise") { self.restore(model.settingsCategory) }
@@ -260,7 +262,7 @@ struct HubSettingsPane: View {
                 BoxedPicker(selection: $settings.audioMicrophone, options: micChoices)
             }
         } header: { groupHeader("Recognition") } footer: {
-            Text("The model and microphone apply from your next dictation — no restart. The lists come from the runtime; a change takes effect immediately.")
+            Text("The model and microphone apply from your next dictation, no restart.")
                 .font(RhemionStyle.font(11)).foregroundStyle(RhemionStyle.secondary(dark)).textCase(nil)
         }
         Section {
@@ -716,6 +718,7 @@ private struct ThemeSegmented: View {
         }
         .padding(2)
         .background(RhemionStyle.hover(dark), in: RoundedRectangle(cornerRadius: 8))
+        .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(RhemionStyle.line(dark), lineWidth: 0.5) }
     }
 }
 
@@ -1236,8 +1239,8 @@ final class HubMenuPanel {
     }
 }
 
-/// The dropdown card — opaque, concentric radii (container 12 / row 6), soft shadow, no arrow — matching
-/// the Journal menu. A selected row shows a leading checkmark; hover/selection highlight is solid gold.
+/// The dropdown card, hosted in `HubMenuPanel`: the shared menu rows on the shared card; no SwiftUI shadow,
+/// the panel's native window shadow traces the rounded card.
 private struct HubMenuCard: View {
     let options: [SettingsChoice]
     let selected: String
@@ -1249,38 +1252,11 @@ private struct HubMenuCard: View {
     var body: some View {
         VStack(spacing: 2) {
             ForEach(options) { option in
-                HubMenuRow(title: option.label, checked: option.id == selected, dark: dark) { pick(option.id) }
+                MenuRow(title: option.label, checked: option.id == selected, dark: dark) { pick(option.id) }
             }
         }
-        .padding(6)
-        .frame(minWidth: min(max(180, minWidth), maxWidth), maxWidth: maxWidth, alignment: .leading)
+        .frame(minWidth: min(max(180, minWidth), maxWidth) - 12, maxWidth: maxWidth - 12, alignment: .leading)
         .fixedSize()
-        .background(RhemionStyle.win(dark), in: RoundedRectangle(cornerRadius: 12))
-        .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(RhemionStyle.line(dark), lineWidth: 0.5) }
-        // No SwiftUI shadow — the panel's native window shadow traces the rounded card (soft, no hard edge).
-    }
-}
-
-private struct HubMenuRow: View {
-    let title: String
-    let checked: Bool
-    let dark: Bool
-    let action: () -> Void
-    @State private var hover = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: "checkmark").font(.system(size: 11, weight: .semibold)).opacity(checked ? 1 : 0).frame(width: 20)
-                Text(title).font(RhemionStyle.font(13)).lineLimit(1).truncationMode(.tail)
-                Spacer(minLength: 8)
-            }
-            .padding(.vertical, 5).padding(.trailing, 8).frame(minHeight: 28).contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(hover ? Color.white : RhemionStyle.text(dark))
-        .background(hover ? RhemionStyle.gold : .clear, in: RoundedRectangle(cornerRadius: 6))
-        .onHover { hover = $0 }
-        .help(title)
+        .menuCard(dark: dark, shadow: false)
     }
 }

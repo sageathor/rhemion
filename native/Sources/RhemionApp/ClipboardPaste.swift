@@ -93,8 +93,11 @@ enum ClipboardPaste {
         }
     }
 
-    private final class Engine: @unchecked Sendable {
+    final class Engine: @unchecked Sendable {
         static let shared = Engine()
+        /// The system clipboard; a test passes a private one, so it never touches the user's.
+        private let pasteboard: NSPasteboard
+        init(pasteboard: NSPasteboard = .general) { self.pasteboard = pasteboard }
 
         private let queue = DispatchQueue(label: "com.sageathor.rhemion.app.clipboard-paste")
         private let sentinelType = NSPasteboard.PasteboardType("com.sageathor.rhemion.paste")
@@ -276,7 +279,7 @@ enum ClipboardPaste {
         }
 
         private func snapshot() -> [[String: Data]] {
-            (NSPasteboard.general.pasteboardItems ?? []).map { item in
+            (pasteboard.pasteboardItems ?? []).map { item in
                 var entries: [String: Data] = [:]
                 for type in item.types {
                     if let data = item.data(forType: type) { entries[type.rawValue] = data }
@@ -286,7 +289,6 @@ enum ClipboardPaste {
         }
 
         private func restore(_ snapshot: [[String: Data]]) {
-            let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             // A password manager's concealed/transient copy is not put back: it clears its own copy on a
             // timer by watching changeCount, which our paste already moved, so a restored secret would stay.
@@ -310,7 +312,6 @@ enum ClipboardPaste {
         }
 
         private func writeTagged(_ text: String) -> (Int, String) {
-            let pasteboard = NSPasteboard.general
             let token = randomToken()
             pasteboard.clearContents()
             let item = NSPasteboardItem()
@@ -324,7 +325,6 @@ enum ClipboardPaste {
         }
 
         private func stillOwns(changeCount: Int, token: String) -> Bool {
-            let pasteboard = NSPasteboard.general
             guard pasteboard.changeCount == changeCount,
                   let top = pasteboard.pasteboardItems?.first,
                   let data = top.data(forType: sentinelType),

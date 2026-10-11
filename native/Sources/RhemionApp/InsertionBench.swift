@@ -50,7 +50,20 @@ final class InsertionBench {
         return bench
     }
 
-    private init(dir: URL) { self.dir = dir }
+    /// Press-time snapshots of the "guarded" route, by session: its deliveries pass the production target rule
+    /// (`allows(matchNow())`) at delivery and again right before ⌘V, as a dictation does.
+    private let guards = Locked<[String: TargetSnapshot]>([:])
+
+    private init(dir: URL) {
+        self.dir = dir
+        let guards = self.guards
+        let check: @Sendable (String) -> Bool = { session in
+            guard let snap = guards.value[session] else { return true }
+            return snap.allows(snap.matchNow().match)
+        }
+        delivery.targetCheck = check
+        delivery.targetRecheck = check
+    }
 
     private func listen() {
         notify_register_dispatch(Self.notification, &token, .main) { [weak self] _ in
@@ -86,11 +99,13 @@ final class InsertionBench {
             return
         }
         var target: String?
+        var pressSnap: TargetSnapshot?
         if request.phase == "press" {
             pressed = pid.map(TargetSnapshot.capture)
             pressedForRefocus = pressed
         } else if let snap = pressed {
             pressed = nil
+            pressSnap = snap
             let (match, detail) = snap.matchNow()
             target = "\(match.rawValue) \(detail)"
         }
@@ -133,6 +148,18 @@ final class InsertionBench {
             }
         case "ax":
             reply("\(AXInsert.insert(request.text, targetPid: pid))")
+        case "guarded":   // a dictation's path: the press snapshot is checked at delivery and before ⌘V
+            let session = "bench-\(request.id)"
+            if let pressSnap { guards.value = { var m = guards.value; m[session] = pressSnap; return m }() }
+            let guards = self.guards
+            delivery.onDeliver(
+                text: request.text, original: nil, session: session, targetPid: pid,
+                inputMethod: "direct", sendAck: { _, _ in },
+                onResult: { status in
+                    guards.value = { var m = guards.value; m[session] = nil; return m }()
+                    reply(status)
+                }
+            )
         case "burst":   // two dictations handed to delivery back to back: both land, in order, once
             let statuses = Locked<[String]>([])
             for (i, text) in [request.text, "[2] " + request.text].enumerated() {

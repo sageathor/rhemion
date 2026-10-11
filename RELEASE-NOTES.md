@@ -27,6 +27,21 @@ Rules:
 
 # Rhemion release notes
 
+## 3.1.1 — 2026-10-14
+
+### Improvements
+- Rhemion now checks that the text really appeared in the field; if the paste did not reach it, the dictation is kept in the Journal as Not inserted instead of being counted as inserted.
+- If you click into another field just as the text arrives, the dictation is marked Not inserted with the reason, so Insert again can still put it where it was meant to go.
+- A dictation with nothing to hear, such as a silent hold or a stray tap, ends with a calm amber outline instead of vanishing without a sign.
+- Journal: a recording in which nothing was heard is marked No speech instead of Failed, and Recognize again is still there.
+- Keyboard shortcuts are shown in the macOS order (⌃⌥⇧⌘) everywhere, and the menu bar's Pin to this window item shows the shortcut you chose.
+- Uninstall: Tab moves between the options, Space ticks them, and Return cancels.
+- While the speech model is missing, the menu bar shows "Finish setup: download the speech model".
+
+### Fixes
+- A second browser window with the same title, opened on top of the first, no longer receives a dictation meant for the first one.
+- Clear Data keeps the same height while its description changes.
+
 ## 3.1.0 — 2026-10-11
 
 ### New
@@ -40,7 +55,7 @@ Rules:
 
 ### Improvements
 - Text pasted into web pages and other apps appears about three times faster.
-- The recording indicator shows how a dictation ended: the waves go out when the text is in, a ring holds when it is kept in the Journal, and the orb empties in red when nothing was recognised.
+- The recording indicator shows how a dictation ended: the waves go out when the text is in, a ring holds when it is kept in the Journal, and the orb empties in red when recognition fails.
 - Paste uses the V key of your current keyboard layout, so it works on Dvorak and other layouts.
 
 ### Fixes

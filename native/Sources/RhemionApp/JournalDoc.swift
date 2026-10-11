@@ -21,16 +21,18 @@ struct JournalEntry: Identifiable, Sendable, Equatable {
     var session: String? = nil
     var deliveryError: String? = nil
 
-    /// What the Journal marks on this entry (3.1). Not inserted: the text exists but never landed; Failed: no text.
+    /// What the Journal marks on this entry (3.1). Not inserted: the text exists but never landed; Failed: recognition
+    /// itself failed (an engine error, or a take cut short by a stop); No speech: recognition ran and heard nothing.
     /// Canceled: stopped with Esc twice and kept (the runtime journals it with the error `canceled`).
     /// Erased: inserted, then taken back with Esc twice (marked by the app, see JournalMarks).
     /// Journal only (Shift with the dictation key) is not delivered on purpose and carries no mark.
-    enum Status: Sendable, Equatable { case notInserted, failed, canceled, erased }
+    enum Status: Sendable, Equatable { case notInserted, failed, noSpeech, canceled, erased }
     var status: Status? {
         if delivered { return nil }
         if deliveryError == "journal-only" { return nil }   // dictated to the journal on purpose (Shift): nothing to flag
         if deliveryError == "canceled" { return .canceled }
-        return transcript.contains(where: { !$0.isWhitespace }) ? .notInserted : .failed
+        if transcript.contains(where: { !$0.isWhitespace }) { return .notInserted }
+        return deliveryError == "recognition-failed" || deliveryError == "recovered" ? .failed : .noSpeech
     }
 
     /// Dictated with Shift to the journal only (3.1): never inserted, so no app goes with it.

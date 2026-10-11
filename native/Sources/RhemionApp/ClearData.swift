@@ -318,6 +318,8 @@ final class ClearDataModel: ObservableObject, Identifiable {
         if selection.contains(.modelInUse) { return "Your current model goes too. You can download it again." }
         return "Everything you don't tick stays."
     }
+    /// The longest of the messages above, whose height the side column keeps.
+    static let longestMessage = "Your current model goes too. You can download it again."
 
     private static func count(_ n: Int, _ one: String, _ many: String) -> String { "\(n) \(n == 1 ? one : many)" }
 
@@ -579,7 +581,8 @@ struct ClearDataView: View {
 
     /// The "what stays" line, then the freed size and the count.
     private var sideColumn: some View {
-        WindowSideColumn(clock: clock, title: "Clear Rhemion Data", subtitle: model.message, hint: Self.hint) {
+        WindowSideColumn(clock: clock, title: "Clear Rhemion Data", subtitle: model.message, hint: Self.hint,
+                         subtitleReserve: ClearDataModel.longestMessage) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(model.freedText).font(RhemionStyle.font(26, .heavy)).monospacedDigit()
                     .foregroundStyle(model.selection.isEmpty || model.freedBytes == nil ? RhemionStyle.tertiary(dark) : RhemionStyle.text(dark))

@@ -12,6 +12,8 @@ enum RhemionStyle {
     /// THE one danger red for every destructive action and warning (Delete, Uninstall, "can't be undone"):
     /// the system red, so it adapts to light/dark (#FF3B30 / #FF453A) and matches native destructive UI.
     static let danger = Color(nsColor: .systemRed)
+    /// The one green: something is ready or granted (Welcome, Speech model, the Journal's export dot). Never decoration.
+    static let success = Color(rhemionHex: 0x2E9E5B)
 
     static func text(_ dark: Bool) -> Color { Color(rhemionHex: dark ? 0xE8E8EC : 0x1D1D1F) }
     static func secondary(_ dark: Bool) -> Color { Color(rhemionHex: dark ? 0xA8A8AE : 0x5F5F66) }
@@ -102,6 +104,46 @@ struct TextLink: View {
         .buttonStyle(.plain)
         .onHover { hover = $0 }
         .fixedSize()
+    }
+}
+
+// MARK: - Menus
+
+/// A row of our dropdown menus (Settings pickers, the Journal grouping menu): a 20 pt checkmark column marks
+/// the current value; the row under the pointer is solid gold with white text. `dark` is passed in because a
+/// menu hosted in its own panel does not inherit the window's appearance.
+struct MenuRow: View {
+    let title: String
+    let checked: Bool
+    let dark: Bool
+    let action: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark").font(.system(size: 11, weight: .semibold)).opacity(checked ? 1 : 0).frame(width: 20)
+                Text(title).font(RhemionStyle.font(13)).lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 8)
+            }
+            .padding(.vertical, 5).padding(.trailing, 8).frame(minHeight: 28).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(hover ? Color.white : RhemionStyle.text(dark))
+        .background(hover ? RhemionStyle.gold : .clear, in: RoundedRectangle(cornerRadius: 6))
+        .onHover { hover = $0 }
+        .help(title)
+    }
+}
+
+extension View {
+    /// The menu card: opaque `win`, radius 12 around 6 pt of inset (so the row radius 6 nests), a 0.5 pt edge.
+    /// `shadow`: false when the hosting panel draws the native window shadow, true when drawn inside a window.
+    func menuCard(dark: Bool, shadow: Bool) -> some View {
+        self.padding(6)
+            .background(RhemionStyle.win(dark), in: RoundedRectangle(cornerRadius: 12))
+            .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(RhemionStyle.line(dark), lineWidth: 0.5) }
+            .shadow(color: .black.opacity(shadow ? (dark ? 0.44 : 0.22) : 0), radius: 17, y: 12)
     }
 }
 
@@ -212,6 +254,8 @@ struct WindowSideColumn<Extra: View>: View {
     let title: String
     var subtitle: String? = nil
     var hint: String? = nil
+    /// The longest subtitle this window can show: its height is kept, so a changing subtitle never resizes the window.
+    var subtitleReserve: String? = nil
     @ViewBuilder var extra: () -> Extra
     @Environment(\.colorScheme) private var scheme
 
@@ -223,10 +267,13 @@ struct WindowSideColumn<Extra: View>: View {
             Text(title).font(WindowLayout.titleFont)
                 .fixedSize(horizontal: false, vertical: true)
             if let subtitle {
-                Text(subtitle)
-                    .font(WindowLayout.subtitleFont).lineSpacing(WindowLayout.subtitleLineSpacing)
-                    .foregroundStyle(RhemionStyle.secondary(dark))
-                    .fixedSize(horizontal: false, vertical: true)
+                ZStack(alignment: .topLeading) {
+                    if let subtitleReserve { Text(subtitleReserve).hidden().accessibilityHidden(true) }
+                    Text(subtitle)
+                }
+                .font(WindowLayout.subtitleFont).lineSpacing(WindowLayout.subtitleLineSpacing)
+                .foregroundStyle(RhemionStyle.secondary(dark))
+                .fixedSize(horizontal: false, vertical: true)
             }
             extra()
             Spacer(minLength: WindowLayout.sideHintGap)

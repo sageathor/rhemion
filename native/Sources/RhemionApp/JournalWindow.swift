@@ -28,7 +28,7 @@ final class JournalModel: ObservableObject {
     }
     /// Statuses whose text can be put back with Insert again.
     func canPutBack(_ e: JournalEntry) -> Bool {
-        guard let s = status(e), s != .failed, e.transcript.contains(where: { !$0.isWhitespace }) else { return false }
+        guard let s = status(e), s != .failed, s != .noSpeech, e.transcript.contains(where: { !$0.isWhitespace }) else { return false }
         return canInsertAgain(e)
     }
     /// Entries with an Insert again in flight: a second click does nothing until the first one finished.
@@ -54,7 +54,7 @@ final class JournalModel: ObservableObject {
     @Published private(set) var recognizeErrors: [String: String] = [:]
     /// A Failed entry, or a Canceled one whose recognition failed (no text), with its recording kept.
     func canRecognizeAgain(_ e: JournalEntry) -> Bool {
-        guard let s = status(e), s == .failed || s == .canceled, recognizeAgain != nil, e.audioURL != nil else { return false }
+        guard let s = status(e), s == .failed || s == .noSpeech || s == .canceled, recognizeAgain != nil, e.audioURL != nil else { return false }
         return !e.transcript.contains(where: { !$0.isWhitespace })
     }
     func runRecognizeAgain(_ e: JournalEntry) {
@@ -132,7 +132,7 @@ struct JournalStatusMark: View {
             case .notInserted:
                 ctx.stroke(circle(4.9), with: .foreground, lineWidth: 1.3 * k)
                 ctx.fill(circle(2.5), with: .foreground)
-            case .failed:
+            case .failed, .noSpeech:   // an empty ring: no text came out
                 ctx.stroke(circle(4.4), with: .foreground, lineWidth: 1.3 * k)
             case .canceled, .erased:   // the ring with a cross (you stopped it) or a line (you took it back)
                 ctx.stroke(circle(4.9), with: .foreground, lineWidth: 1.3 * k)
@@ -167,7 +167,7 @@ struct InsertAgainIcon: View {
 
 extension JournalEntry.Status {
     var label: String {
-        switch self { case .notInserted: return "Not inserted"; case .failed: return "Failed"; case .canceled: return "Canceled"; case .erased: return "Erased" }
+        switch self { case .notInserted: return "Not inserted"; case .failed: return "Failed"; case .noSpeech: return "No speech"; case .canceled: return "Canceled"; case .erased: return "Erased" }
     }
 }
 
@@ -301,7 +301,7 @@ struct JournalView: View {
                 Color.clear.contentShape(Rectangle()).onTapGesture { groupMenu = false }
                 JournalMenuCard {
                     ForEach(JournalGrouping.allCases, id: \.self) { option in
-                        JournalMenuRow(title: option.rawValue, checked: grouping == option) { grouping = option; groupMenu = false }
+                        MenuRow(title: option.rawValue, checked: grouping == option, dark: dark) { grouping = option; groupMenu = false }
                     }
                 }
                 .fixedSize()
@@ -327,7 +327,7 @@ struct JournalView: View {
             // The export chip + "Export now" action vanish entirely when export is turned Off in settings.
             if exportMode != "off" {
                 HStack(spacing: 5) {
-                    Circle().fill(Color(journalHex: 0x2E9E5B)).frame(width: 6, height: 6)
+                    Circle().fill(RhemionStyle.success).frame(width: 6, height: 6)
                     Text("Export: \(exportMode)")
                 }.font(JournalStyle.font(11)).padding(7).background(JournalStyle.content(dark), in: RoundedRectangle(cornerRadius: 7))
                     .help("Current export mode")
@@ -470,8 +470,8 @@ struct JournalView: View {
     }
 }
 
-/// A 30×30 toolbar icon toggle in the icon-toggle style: neutral gray chip when active,
-/// gray (`--line2`) on hover — never an accent tint (it sits quietly next to the window chrome).
+/// A 30×30 toolbar icon toggle: the raised neutral tile (`activeTile`) when on, a faint wash on hover
+/// when off; never an accent tint.
 private struct JournalToolbarToggle: View {
     let systemImage: String
     let on: Bool
@@ -562,42 +562,15 @@ private struct InfoAnchorKey: PreferenceKey {
     static func reduce(value: inout CGRect, nextValue: () -> CGRect) { let next = nextValue(); if next != .zero { value = next } }
 }
 
-/// The shared menu/popover surface: opaque (not glass), concentric radii —
-/// container radius 12, inner inset 6, so a row-highlight radius of 6 nests perfectly (12 − 6 = 6).
+/// The grouping menu, drawn inside the window: the shared menu rows on the shared card, with its own shadow.
 private struct JournalMenuCard<Content: View>: View {
     @ViewBuilder let content: Content
     @Environment(\.colorScheme) private var scheme
     private var dark: Bool { scheme == .dark }
     var body: some View {
         VStack(spacing: 2) { content }
-            .padding(6)
-            .frame(width: 232)
-            .background(JournalStyle.win(dark), in: RoundedRectangle(cornerRadius: 12))
-            .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(JournalStyle.line(dark), lineWidth: 0.5) }
-            .shadow(color: .black.opacity(dark ? 0.44 : 0.22), radius: 17, y: 12)
-    }
-}
-
-/// A menu row in the native-menu layout: a leading 20px accessory column holding a checkmark for the
-/// selected item, then the label. Highlight = solid gold with WHITE text (both themes), radius 6.
-private struct JournalMenuRow: View {
-    let title: String
-    let checked: Bool
-    let action: () -> Void
-    @Environment(\.colorScheme) private var scheme
-    @State private var hover = false
-    private var dark: Bool { scheme == .dark }
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: "checkmark").font(.system(size: 11, weight: .semibold)).opacity(checked ? 1 : 0).frame(width: 20)
-                Text(title).font(JournalStyle.font(13))
-                Spacer(minLength: 0)
-            }.padding(.vertical, 5).padding(.trailing, 8).frame(minHeight: 28).contentShape(Rectangle())
-        }.buttonStyle(.plain)
-            .foregroundStyle(hover ? Color.white : JournalStyle.text(dark))
-            .background(hover ? JournalStyle.gold : .clear, in: RoundedRectangle(cornerRadius: 6))
-            .onHover { hover = $0 }
+            .frame(width: 232 - 12)
+            .menuCard(dark: dark, shadow: true)
     }
 }
 /// Raised R1 button (DESIGN.md) — the exact treatment of the Dictionary's "Add replacement": a raised
@@ -637,7 +610,7 @@ private struct JournalQuietAction: View {
                 Text(title).font(JournalStyle.font(12.5, .regular))
             }
             .foregroundStyle(color ?? JournalStyle.text(dark))
-            .opacity(hover ? 0.7 : 1)
+            .opacity(hover ? 0.75 : 1)
             .contentShape(Rectangle())
         }.buttonStyle(.plain).onHover { hover = $0 }
     }
@@ -733,7 +706,7 @@ private struct JournalRow: View {
                 Button(action: insertAgain) { InsertAgainIcon(size: 13).foregroundStyle(JournalStyle.tertiary(dark)).frame(width: 18, height: 18) }
                     .buttonStyle(.plain).opacity(hovered ? 1 : 0).allowsHitTesting(hovered).help("Insert again: put it back in the field where you dictated it")
             }
-            if status != .failed, entry.transcript.contains(where: { !$0.isWhitespace }) {   // nothing to copy without text
+            if status != .failed, status != .noSpeech, entry.transcript.contains(where: { !$0.isWhitespace }) {   // nothing to copy without text
                 Button(action: copy) { Image(systemName: "doc.on.doc").font(.system(size: 12, weight: .regular)).foregroundStyle(JournalStyle.tertiary(dark)).frame(width: 18, height: 18) }
                     .opacity(hovered ? 1 : 0).allowsHitTesting(hovered).help("Copy (Final)")
             }
@@ -858,6 +831,8 @@ private struct JournalDetail: View {
         case .notInserted:
             switch entry.deliveryError {
             case "target-lost": return "Focus moved elsewhere before the text was ready."
+            case "paste-unchanged": return "The paste was sent, but the text didn’t appear in the field."
+            case "paste-elsewhere": return "Focus moved to another field as the text arrived, so it may have landed there."
             case "recovered": return "Rhemion stopped before this dictation finished. It was recognised from the recording afterwards, so it was not inserted."
             case "recognized-again": return "Recognised again from the recording. It has not been inserted anywhere yet."
             default: return "It could not be inserted where you were typing."
@@ -869,6 +844,8 @@ private struct JournalDetail: View {
             case "recognition-failed": return "Recognition failed, so there is no text.\(kept)"
             default: return "Speech wasn’t recognised, so there is no text.\(kept)"
             }
+        case .noSpeech:
+            return "Nothing was heard in this recording.\(entry.audioURL != nil ? " The recording is kept below." : "")"
         case .canceled:
             let until = entry.ts.addingTimeInterval(Double(max(1, model.keepCanceledHours)) * 3600)
             let f = DateFormatter()   // system wording and translation: "tomorrow at 11:52", "Wednesday at 9:05"
@@ -1001,8 +978,8 @@ private struct JournalPlayer: View {
         player?.rate = Float(rate)   // live while playing; re-applied after the next play()
     }
 }
-/// The Play/Pause face — a raised NEUTRAL circle matching the Copy button (Raised R1): win fill + a
-/// hairline border + a soft shadow, hover shifts the fill. Monochrome (no gold, no breathing glow).
+/// The Play/Pause face: a raised neutral circle with the Raised button's fill, hairline and shadow; hover
+/// shifts the fill. Monochrome (no gold, no breathing glow).
 private struct JournalPlayStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         JournalPlayFace(label: configuration.label, pressed: configuration.isPressed)
@@ -1018,7 +995,7 @@ private struct JournalPlayFace<Label: View>: View {
         label
             .background(hover ? JournalStyle.line2(dark) : JournalStyle.win(dark), in: Circle())
             .overlay { Circle().strokeBorder(JournalStyle.line(dark), lineWidth: 0.5) }
-            .shadow(color: .black.opacity(dark ? 0.22 : 0.10), radius: 1.5, y: 1)
+            .shadow(color: .black.opacity(dark ? 0.22 : 0.06), radius: 1.5, y: 1)
             .scaleEffect(pressed ? 0.95 : 1)
             .onHover { hover = $0 }
     }

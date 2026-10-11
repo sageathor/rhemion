@@ -61,29 +61,61 @@ struct TargetSnapshot: @unchecked Sendable {
 
     /// Compares this snapshot with what is focused now. `detail` is for the log.
     func matchNow() -> (match: Match, detail: String) {
-        guard let front = NSWorkspace.shared.frontmostApplication.map({ Int($0.processIdentifier) }) else {
-            return (.unknown, "no frontmost app")
-        }
-        guard front == pid else { return (.otherApp, "pid \(pid) → \(front)") }
+        let front = NSWorkspace.shared.frontmostApplication.map { Int($0.processIdentifier) }
+        guard let front, front == pid else { return Self.decide(MatchInput(frontPid: front, pid: pid)) }
         let now = TargetSnapshot.capture(pid: pid)
-        let role = fingerprint?.role ?? "-"
-        if let a = element, let b = now.element, CFEqual(a, b) { return (.sameElement, role) }
-        // The same window: the same AX object, or (an app that re-creates it) the same title AND the same frame.
-        // Log details carry roles only, never titles or DOM ids (they can hold the user's own text).
-        let sameWindow: Bool? = {
-            if let a = window, let b = now.window {
-                if CFEqual(a, b) { return true }
-                guard let t = windowTitle, t == now.windowTitle, let f = windowFrame, let g = now.windowFrame else { return false }
-                return abs(f.minX - g.minX) < 1 && abs(f.minY - g.minY) < 1 && abs(f.width - g.width) < 1 && abs(f.height - g.height) < 1
-            }
-            return nil
-        }()
-        if sameWindow == false { return (.otherWindow, role) }
-        guard let f0 = fingerprint, let f1 = now.fingerprint else {
-            return (.unknown, "field \(element == nil ? "unreadable" : "readable") → \(now.element == nil ? "unreadable" : "readable")")
+        var input = MatchInput(frontPid: front, pid: pid)
+        if let a = element, let b = now.element { input.sameElement = CFEqual(a, b) }
+        if let a = window, let b = now.window {
+            let same = CFEqual(a, b)
+            input.window = .init(sameObject: same, oldStillThere: !same && Self.exists(a), title: windowTitle,
+                                 nowTitle: now.windowTitle, frame: windowFrame, nowFrame: now.windowFrame)
         }
-        if f0 == f1 { return (.sameField, role) }
-        return (.otherField, "\(role) → \(f1.role ?? "-")")
+        input.fingerprint = fingerprint; input.nowFingerprint = now.fingerprint
+        input.elementReadable = element != nil; input.nowElementReadable = now.element != nil
+        return Self.decide(input)
+    }
+
+    /// What `matchNow` reads from AX, as plain values: the decision below is the whole rule and is tested alone.
+    struct MatchInput: Sendable {
+        struct Window: Sendable {
+            var sameObject: Bool
+            /// The press-time window object still answers: then a different object is a different window.
+            var oldStillThere = false
+            var title: String?, nowTitle: String?
+            var frame: CGRect?, nowFrame: CGRect?
+        }
+        var frontPid: Int?
+        var pid: Int
+        var sameElement = false
+        /// Nil when either side has no focused window.
+        var window: Window? = nil
+        var fingerprint: Fingerprint? = nil, nowFingerprint: Fingerprint? = nil
+        var elementReadable = false, nowElementReadable = false
+    }
+
+    static func decide(_ i: MatchInput) -> (match: Match, detail: String) {
+        guard let front = i.frontPid else { return (.unknown, "no frontmost app") }
+        guard front == i.pid else { return (.otherApp, "pid \(i.pid) → \(front)") }
+        let role = i.fingerprint?.role ?? "-"
+        if i.sameElement { return (.sameElement, role) }
+        // The same window: the same AX object, or (an app that re-created it, so the old object is gone) the same
+        // title AND the same frame. While the old object still answers, a different object is another window:
+        // a second browser window opens on the very spot of the first, with the same title. Logged apart.
+        // Log details carry roles only, never titles or DOM ids (they can hold the user's own text).
+        var byTitle = false
+        if let w = i.window, !w.sameObject {
+            guard !w.oldStillThere, let t = w.title, t == w.nowTitle, let f = w.frame, let g = w.nowFrame,
+                  abs(f.minX - g.minX) < 1, abs(f.minY - g.minY) < 1, abs(f.width - g.width) < 1, abs(f.height - g.height) < 1
+            else { return (.otherWindow, role) }
+            byTitle = true
+        }
+        guard let f0 = i.fingerprint, let f1 = i.nowFingerprint else {
+            return (.unknown, "field \(i.elementReadable ? "readable" : "unreadable") → \(i.nowElementReadable ? "readable" : "unreadable")")
+        }
+        let via = byTitle ? " window-by-title" : ""
+        if f0 == f1 { return (.sameField, role + via) }
+        return (.otherField, "\(role) → \(f1.role ?? "-")" + via)
     }
 
     /// Whether a delivery may go ahead given this match. Another app or window keeps the text; another field
@@ -94,6 +126,13 @@ struct TargetSnapshot: @unchecked Sendable {
         case .otherApp, .otherWindow: return false
         case .otherField: return !editable
         }
+    }
+
+    /// Whether an AX object still answers (a closed or re-created window does not).
+    static func exists(_ e: AXUIElement) -> Bool {
+        AXUIElementSetMessagingTimeout(e, axTimeout)
+        var v: CFTypeRef?
+        return AXUIElementCopyAttributeValue(e, kAXRoleAttribute as CFString, &v) == .success
     }
 
     /// Brings the target back: activates its app, raises its window and focuses its field, then waits (up to

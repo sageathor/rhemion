@@ -39,9 +39,19 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// "Pin to this window" (3.1): every dictation goes to the pinned window's field.
     let pin = PinnedWindow()
     private var pinMenuItem: NSMenuItem?
+
+    /// The menu-bar item shows the Pin chord bound in Settings, or none when it is off.
+    private func showPinShortcut(_ specs: [String]) {
+        let chord = HotkeySpec.menuEquivalent(specs)
+        pinMenuItem?.keyEquivalent = chord?.key ?? ""
+        pinMenuItem?.keyEquivalentModifierMask = chord?.modifiers ?? []
+    }
     /// Press-time targets by runtime session (the last 100 takes), for the Journal's Insert again.
     /// The press that started the coming take was Journal only (Shift): read once by its `.started` (3.1).
     private let journalPress = Locked<Bool>(false)
+    /// The app itself ended the take (Esc twice, a data operation): its `canceled` just retracts. Any other
+    /// `canceled` after a stop means the take had no speech, which gets the calm empty-take cue.
+    let userCanceled = Locked<Bool>(false)
     /// Insert again (3.1): the entry's press-time target, keyed by the `again-…` session, so the
     /// delivery checks the restored field strictly (same element or same field) right before AX or ⌘V.
     let againTargets = Locked<[String: TargetSnapshot]>([:])
@@ -115,7 +125,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var micRestartPending = false
     /// Watches for a microphone grant made in System Settings while Welcome is closed (stops once granted).
     private var micWatchTimer: Timer?
-    private var setupIncompleteItem: NSMenuItem?   // "Setup incomplete — download model", shown only when missing
+    private var setupIncompleteItem: NSMenuItem?   // "Finish setup: download the speech model", shown only when missing
     let inputMethod = Locked<String>("direct")
 
     override init() {
@@ -141,7 +151,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         hubItem.target = self
         // Shown only while the speech model is missing (setup incomplete) — the one gentle nudge, no red badge.
         // Opens Welcome, where the Download button lives. Hidden by default; toggled in updateSetupMenuItem().
-        let setupItem = NSMenuItem(title: "Setup incomplete — download model", action: #selector(openWelcome), keyEquivalent: "")
+        let setupItem = NSMenuItem(title: "Finish setup: download the speech model", action: #selector(openWelcome), keyEquivalent: "")
         setupItem.target = self
         setupItem.isHidden = true
         setupIncompleteItem = setupItem
@@ -164,9 +174,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(setupItem)
         menu.addItem(.separator())
         // Pin to this window (3.1): the menu-bar menu does not change the frontmost app, so "this window" is the
-        // one the user was in. The shortcut shown is the default global chord.
-        let pinItem = NSMenuItem(title: pin.isPinned ? "Unpin window" : "Pin to this window", action: #selector(togglePin), keyEquivalent: "p")
-        pinItem.keyEquivalentModifierMask = [.command, .option]
+        // one the user was in. The shortcut shown is the chord bound in Settings (none when it is off).
+        let pinItem = NSMenuItem(title: pin.isPinned ? "Unpin window" : "Pin to this window", action: #selector(togglePin), keyEquivalent: "")
         pinItem.target = self
         pinMenuItem = pinItem
         menu.addItem(pinItem)
@@ -306,7 +315,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         if modelDownload.isReady { indicator?.endModelCue(); setStatus("") }
     }
 
-    /// Show the "Setup incomplete — download model" menu line only when the model is actionable-missing
+    /// Show the "Finish setup: download the speech model" menu line only when the model is actionable-missing
     /// (absent or a failed download), never while it's downloading/preparing/ready. No persistent red badge.
     @MainActor private func updateSetupMenuItem() {
         let show: Bool
@@ -430,6 +439,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         //    the runtime always has a complete snapshot, then load our view of it.
         SettingsStore.ensureExists()
         settings = SettingsStore.load()
+        showPinShortcut(settings.pinHotkeys)   // the menu was built before settings were read
         settings.applyAppearance()
         inputMethod.value = settings.inputMethod
         // Reconcile the login-item registration to the saved preference (default on). Non-fatal: a
@@ -523,19 +533,22 @@ final class AppController: NSObject, NSApplicationDelegate {
             return allowed
         }
         let journalPress = self.journalPress
+        let userCanceled = self.userCanceled
         client.onEvent = { [weak client, weak self, inputMethod] event in
             // Per-tick microphone levels aren't logged (dozens a second while dictating); state changes are.
             if case .level = event {} else { log("event: \(eventLabel(event))") }
             switch event {
             case .started(let s):
-                perf.markStarted(); targets.started(session: s)
+                perf.markStarted(); targets.started(session: s); userCanceled.value = false
                 let journal = journalPress.value; journalPress.value = false
                 Task { @MainActor in indicator.recording(journalOnly: journal) }
             case .level(let rms): Task { @MainActor in indicator.onLevel(rms); self?.hotkey?.onLevel(rms) }
             case .stopped:        perf.markStopped(); Task { @MainActor in indicator.processing() }
             case let .transcript(_, ms, _): perf.markTranscript(engineMS: ms)
             case .canceled(let s):
-                perf.cancel(); Task { @MainActor in indicator.hide() }
+                let byUser = userCanceled.value; userCanceled.value = false
+                // Esc twice (or a data operation) retracts at once; a take with no speech gets the empty-take cue.
+                perf.cancel(); Task { @MainActor in if byUser { indicator.hide() } else { indicator.empty() } }
                 // A kept cancel is journaled by the runtime: keep its press-time target for Insert again.
                 if let snap = targets.take(session: s) {
                     recents.value = { var m = recents.value; m[s] = (Date(), snap); return m }()
@@ -772,6 +785,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                     self.dictAdd?.setHotkeys(updated.dictAddHotkeys)
                     self.undoReplace?.setHotkeys(updated.undoHotkeys)
                 }
+                self.showPinShortcut(updated.pinHotkeys)
                 self.undoStore.setTTL(Double(updated.undoTTLSecs))
                 self.pin.autoUnpinMinutes = updated.pinAutoUnpin ? updated.pinAutoUnpinMinutes : 0
                 self.escGesture?.setWindowMS(updated.escDoubleTapMS)

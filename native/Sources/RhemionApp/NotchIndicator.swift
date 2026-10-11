@@ -72,6 +72,9 @@ final class NotchIndicator {
     func journaled() { show(); view?.finish(.journaled) }
     /// No text was kept (recognition failed) or a command failed: the source goes out, in the danger red.
     func failed() { show(); view?.finish(.failed) }
+    /// The key was held but nothing was said: not an error. The orb empties into a whole amber outline, holds a
+    /// moment and fades; nothing travels, nothing turns red.
+    func empty() { show(); view?.finish(.empty) }
     func error() { failed() }
     func hide() { view?.hide() }
 
@@ -264,7 +267,7 @@ private final class IndicatorView: NSView {
 
     private var meterTimer: Timer?, animTimer: Timer?, spinTimer: Timer?, graceTimer: Timer?, procTimer: Timer?
     private var echoTimer: Timer?   // the pinned rest's echo bursts (separate from slide()'s animTimer)
-    enum Outcome { case inserted, kept, failed, journaled }
+    enum Outcome { case inserted, kept, failed, journaled, empty }
     private var waitStart: CFTimeInterval = 0
     private var outcome: (kind: Outcome, start: CFTimeInterval, from: Breath)?
     private var retractFrom: CGFloat?
@@ -596,7 +599,7 @@ private final class IndicatorView: NSView {
     private static func duration(_ kind: Outcome) -> Double {
         // Kept asks for an action (put the text back), so it stays long enough to notice after switching windows;
         // a new dictation clears it at once (recording() stops everything).
-        switch kind { case .inserted: return 0.55; case .kept: return 5.0; case .failed: return 2.5; case .journaled: return 0.9 }
+        switch kind { case .inserted: return 0.55; case .kept: return 5.0; case .failed: return 2.5; case .journaled: return 0.9; case .empty: return 1.1 }
     }
 
     // MARK: the waiting breath (the Welcome logo's law, scaled to the ear)
@@ -731,6 +734,7 @@ private final class IndicatorView: NSView {
             case .inserted: drawSphere(ctx, r: b.orbR, a: 1 - S.smooth(u / 0.3))
             case .kept: strokeRing(ctx, 7.4, f, 1.9); drawSphere(ctx, r: 3.5, a: f)
             case .failed: strokeRing(ctx, 3.9, f, 1.4, REDC)
+            case .empty: strokeRing(ctx, 3.4, 0.9 * f, 1.0)
             case .journaled:
                 for (i, r) in S.logoR.prefix(4).enumerated() { strokeRing(ctx, r, f * S.restA(i), S.restW(i)) }
                 drawSphere(ctx, r: pinned ? 3.3 : 4.4, a: pinned ? 0.85 : f)
@@ -767,6 +771,12 @@ private final class IndicatorView: NSView {
             drawSphere(ctx, r: b.orbR, a: f * (1 - empty), halo: b.halo * (1 - empty), col: c, hi: h)
             strokeRing(ctx, b.orbR - 0.6, f * empty, 1.4, REDC)
             if pinned { drawSphere(ctx, r: 3.3, a: 0.85 * S.smooth(S.span(u, 2.1, 2.5)), halo: 0.8) }   // back to rest
+        case .empty:      // nothing was said: the orb empties into a whole amber outline, holds, fades; no travel, no red
+            let empty = S.smooth(u / 0.25), f = 1 - S.span(u, 0.8, 1.1)
+            for ring in b.rings { strokeRing(ctx, ring.r, ring.a * (1 - empty), ring.w) }
+            drawSphere(ctx, r: b.orbR + (3.2 - b.orbR) * empty, a: 1 - empty, halo: b.halo * (1 - empty))
+            strokeRing(ctx, 3.4, 0.9 * empty * f, 1.0)
+            if pinned { drawSphere(ctx, r: 3.3, a: 0.85 * S.smooth(S.span(u, 0.8, 1.1)), halo: 0.8) }   // back to rest
         case .journaled:  // the mark comes to rest: the four rings settle into the logo, still, then all fade as one
             let q = S.smooth(S.span(u, 0, 0.25)), f = 1 - S.easeOut(S.span(u, 0.5, 0.9))
             for i in 0..<4 {
